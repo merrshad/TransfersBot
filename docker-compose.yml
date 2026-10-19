@@ -1,0 +1,52 @@
+name: bale-telegram-bridge
+
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bale-telegram-bridge:0.1.0
+    container_name: bale-telegram-bridge
+    restart: unless-stopped
+    init: true
+
+    # Copy .env.example to .env first. The file holds both bot tokens and the
+    # numeric owner ids; it is gitignored and excluded from the image context.
+    env_file:
+      - .env
+
+    environment:
+      # Settings win over .env values and point at the persistent volumes.
+      DB_PATH: /app/data/bridge.db
+      MEDIA_TEMP_DIR: /app/media
+      HEALTHCHECK_FILE: /app/data/health
+      TZ: UTC
+
+    # A 2 GB VPS runs this comfortably; the cap protects the host from a runaway
+    # allocation while leaving plenty of room for 20–50 MB media streaming.
+    mem_limit: 1g
+    pids_limit: 256
+
+    volumes:
+      # SQLite database (including -wal/-shm files) and the heartbeat marker.
+      - bridge-db:/app/data
+      # Files spooled between download and upload.
+      - bridge-media:/app/media
+
+    # The worker gets up to SHUTDOWN_TIMEOUT_SECONDS to finish its current send.
+    stop_grace_period: 45s
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bridge-db:
+  bridge-media:

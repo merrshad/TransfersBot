@@ -1,0 +1,32 @@
+# Never bake secrets into an image.
+.env
+.env.*
+!.env.example
+
+# Version control and local tooling
+.git
+.gitignore
+.github
+.idea
+.vscode
+.freebuff
+
+# Python caches and build artefacts
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Local runtime data and tests (the image runs the app, not the suite)
+data
+tests
+docker-compose.yml
