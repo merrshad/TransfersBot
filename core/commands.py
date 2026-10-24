@@ -24,8 +24,8 @@ from core.errors import (
     PermissionDeniedError,
     UserNotFoundError,
 )
-from core.ids import normalise_public_id
-from core.models import InlineButton, OutboxStats
+from core.ids import normalise_public_id, pair_deep_link
+from core.models import InlineButton, OutboxStats, Platform
 from core.pairing import Pair, PairingService, PairRequest
 from core.users import User, UserService
 
@@ -155,7 +155,7 @@ class CommandRouter:
         "🔹 /start – شروع و منوی اصلی\n"
         "🔹 /whoami – شناسه و وضعیت شما\n"
         "🔹 /status – جفت‌ها و درخواست‌ها\n"
-        "🔹 /pair <شناسه کاربر> – درخواست جفت‌سازی\n"
+        "🔹 /pair – ساخت لینک جفت‌سازی خودکار\n"
         "🔹 /pending – درخواست‌های دریافتی\n"
         "🔹 /accept <شناسه درخواست> – پذیرش\n"
         "🔹 /reject <شناسه درخواست> – رد\n"
@@ -180,11 +180,15 @@ class CommandRouter:
         pairing: PairingService,
         stats: OutboxStatsProvider | None = None,
         *,
+        telegram_bot_username: str = "",
+        bale_bot_username: str = "",
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._users = users
         self._pairing = pairing
         self._stats = stats
+        self._telegram_bot_username = telegram_bot_username.strip().lstrip("@")
+        self._bale_bot_username = bale_bot_username.strip().lstrip("@")
         self._clock = clock or (lambda: datetime.now(UTC))
 
     # ------------------------------------------------------------- public API
@@ -244,7 +248,7 @@ class CommandRouter:
         if data == "menu:unpair":
             return self.handle(actor.id, "/status")
         if data == "menu:pair":
-            return (self._pair_prompt(actor),)
+            return (self._pair_offer(actor),)
         if data == "menu:owner":
             return (self._owner_menu(actor),)
         if data == "menu:users":
@@ -344,19 +348,44 @@ class CommandRouter:
             self._back_row(),
         )
 
-    def _pair_prompt(self, actor: User) -> SendMessageAction:
-        """Explain the only step a button cannot do: entering the partner id."""
+    def _pair_offer(self, actor: User) -> SendMessageAction:
+        """Create a one-time deep link to the opposite platform's bot."""
+        target = (
+            Platform.BALE
+            if actor.platform is Platform.TELEGRAM
+            else Platform.TELEGRAM
+        )
+        username = (
+            self._bale_bot_username
+            if target is Platform.BALE
+            else self._telegram_bot_username
+        )
+        if not username:
+            return self._send(
+                actor.id,
+                "⚠️ نام کاربری ربات مقابل در تنظیمات ثبت نشده است.\n"
+                "مقدار TELEGRAM_BOT_USERNAME / BALE_BOT_USERNAME را تنظیم کنید.",
+                buttons=self._main_buttons(actor),
+            )
+        try:
+            invite = self._pairing.create_invite(actor.id, target)
+        except DomainError as exc:
+            return self._send(
+                actor.id, str(exc), buttons=self._main_buttons(actor)
+            )
+
+        link = pair_deep_link(target, username, invite.token)
+        label = "بله" if target is Platform.BALE else "تلگرام"
         return self._send(
             actor.id,
-            "🔗 جفت‌سازی\n\n"
-            "۱) طرف مقابل با /start وارد ربات شود.\n"
-            "۲) او با /whoami شناسهٔ کوتاه و تصادفی‌اش را ببیند.\n"
-            "۳) شما دستور زیر را بفرستید:\n"
-            "/pair <شناسه طرف مقابل>\n\n"
-            "پس از ارسال، طرف مقابل می‌تواند با دکمه‌های زیر پیام، درخواست را بپذیرد.",
+            "🔗 اتصال دو حساب\n\n"
+            f"روی دکمهٔ زیر بزن تا ربات {label} باز شود و با استارت کردن، "
+            "جفت‌سازی به‌صورت خودکار انجام شود.\n\n"
+            "⏳ این لینک یک‌بارمصرف است و بعد از چند دقیقه منقضی می‌شود.",
             buttons=(
+                (InlineButton(f"🚀 باز کردن ربات {label}", url=link),),
                 (
-                    InlineButton("📥 درخواست‌های من", "menu:pending"),
+                    InlineButton("🔄 لینک جدید", "menu:pair"),
                     InlineButton("🏠 منوی اصلی", "menu:main"),
                 ),
             ),
@@ -460,15 +489,59 @@ class CommandRouter:
     # --------------------------------------------------------------- handlers
 
     def _cmd_start(self, actor: User, command: Command) -> tuple[Action, ...]:
-        """Handle ``/start``: greet and show the actor's internal id."""
+        """Handle ``/start`` and consume a cross-bot pairing token if present."""
+        if command.args:
+            token = command.args[0].strip()
+            try:
+                pair = self._pairing.consume_invite(token, actor.id)
+            except DomainError as exc:
+                return (
+                    self._send(
+                        actor.id,
+                        f"❌ {exc}\n\n"
+                        "برای ساخت لینک تازه، دکمهٔ «🔗 جفت‌سازی» را بزنید.",
+                        buttons=self._main_buttons(actor),
+                    ),
+                )
+            partner_id = pair.other(actor.id)
+            partner = self._users.get(partner_id)
+            partner_label = (
+                partner.public_id if partner is not None and partner.public_id else str(partner_id)
+            )
+            return (
+                self._send(
+                    actor.id,
+                    "🎉 اتصال برقرار شد!\n\n"
+                    f"حساب شما به کاربر {partner_label} وصل شد. "
+                    "از این به بعد پیام‌ها و فایل‌ها بین دو حساب رد و بدل می‌شوند.",
+                    buttons=(
+                        (
+                            InlineButton("📊 وضعیت", "menu:status"),
+                            InlineButton("🏠 منوی اصلی", "menu:main"),
+                        ),
+                    ),
+                ),
+                self._send(
+                    partner_id,
+                    "🎉 اتصال برقرار شد!\n\n"
+                    f"کاربر {actor.public_id} با لینک جفت‌سازی، حسابش را به شما وصل کرد.",
+                    buttons=(
+                        self._main_buttons(partner)
+                        if partner is not None
+                        else ()
+                    ),
+                ),
+            )
+
         return (
             self._send(
                 actor.id,
                 "🌟 به پل بله ↔ تلگرام خوش آمدید\n\n"
                 f"شناسهٔ شما: {actor.public_id}\n\n"
-                "با گزینه‌های زیر شروع کنید. برای اتصال به طرف مقابل، "
-                "ابتدا هر دو نفر /start بزنید و سپس از «🔗 جفت‌سازی» استفاده کنید.\n"
-                "اگر دکمه‌ها را نمی‌بینید: /pair <شناسه طرف مقابل>",
+                "برای اتصال به طرف مقابل، کافی است دکمهٔ «🔗 جفت‌سازی» را بزنید؛ "
+                "لینک ربات مقابل به‌صورت خودکار ساخته می‌شود و با استارت کردنش "
+                "جفت‌سازی انجام می‌شود.\n"
+                "دستور جایگزین: /pair",
                 buttons=self._main_buttons(actor),
             ),
         )
@@ -569,8 +642,10 @@ class CommandRouter:
         return (self._send(actor.id, "\n".join(lines), buttons=tuple(rows)),)
 
     def _cmd_pair(self, actor: User, command: Command) -> tuple[Action, ...]:
-        """Handle ``/pair <public_id>``: create a pending request."""
-        public_id = command.public_id_arg(0, usage="/pair <شناسه کاربر>")
+        """Handle ``/pair``: create a deep link, or the legacy public-id request."""
+        if not command.args:
+            return (self._pair_offer(actor),)
+        public_id = command.public_id_arg(0, usage="/pair [شناسه کاربر]")
         target = self._users.get_by_public_id(public_id)
         if target is None:
             raise UserNotFoundError()

@@ -967,7 +967,13 @@ def _inline_markup(
     """Translate the domain button grid into PTB's inline markup."""
     rows = [
         [
-            InlineKeyboardButton(text=button.text, callback_data=button.callback_data)
+            (
+                InlineKeyboardButton(text=button.text, url=button.url)
+                if button.url is not None
+                else InlineKeyboardButton(
+                    text=button.text, callback_data=button.callback_data
+                )
+            )
             for button in row
         ]
         for row in buttons

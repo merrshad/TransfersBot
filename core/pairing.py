@@ -27,6 +27,7 @@ from core.errors import (
     InvalidTransitionError,
     NotRequesterError,
     NotRequestTargetError,
+    PairInviteInvalidError,
     PairLimitReachedError,
     PairNotActiveError,
     PairNotFoundError,
@@ -37,6 +38,7 @@ from core.errors import (
     UserBannedError,
     UserNotFoundError,
 )
+from core.models import Platform
 from core.ports import TransactionManager
 from core.users import User, UserRepositoryPort
 
@@ -166,6 +168,29 @@ class PairRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class PairingInvite:
+    """A one-time deep-link invite from one platform to the other."""
+
+    id: int
+    token: str
+    inviter_id: int
+    target_platform: Platform
+    created_at: datetime
+    expires_at: datetime
+    used_at: datetime | None = None
+    used_by_id: int | None = None
+
+    @property
+    def is_used(self) -> bool:
+        """Whether the invite was already consumed."""
+        return self.used_at is not None
+
+    def is_expired(self, now: datetime) -> bool:
+        """Whether the invite's TTL elapsed at ``now``."""
+        return now >= self.expires_at
+
+
+@dataclass(frozen=True, slots=True)
 class PairingOverview:
     """Aggregate pairing counters for owner-facing reporting (no content)."""
 
@@ -269,6 +294,36 @@ class PairRequestRepositoryPort(Protocol):
         ...
 
 
+@runtime_checkable
+class PairingInviteRepositoryPort(Protocol):
+    """Persistence for one-time cross-platform pairing invitations."""
+
+    def create(
+        self,
+        *,
+        inviter_id: int,
+        target_platform: Platform,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> PairingInvite:
+        """Insert an invite and return it (the repository generates the token)."""
+        ...
+
+    def get_by_token(self, token: str) -> PairingInvite | None:
+        """Fetch an invite by its URL-safe token."""
+        ...
+
+    def invalidate_for_inviter(self, inviter_id: int, now: datetime) -> int:
+        """Expire every still-unused invite belonging to ``inviter_id``."""
+        ...
+
+    def mark_used(
+        self, invite_id: int, *, used_by_id: int, used_at: datetime
+    ) -> PairingInvite | None:
+        """Mark an invite consumed by ``used_by_id``."""
+        ...
+
+
 class PairingService:
     """Applies every pairing rule on top of the repositories.
 
@@ -279,6 +334,9 @@ class PairingService:
         tx: Transaction manager sharing the connection with the repositories.
         max_pairs_per_user: Maximum simultaneously active pairs per user.
         request_ttl: Lifetime of a freshly created pending request.
+        invites: One-time deep-link invite repository (optional for tests that
+            never use the invite flow).
+        invite_ttl: Lifetime of a deep-link invite.
         clock: Injectable UTC clock, mainly for deterministic tests.
     """
 
@@ -291,18 +349,24 @@ class PairingService:
         *,
         max_pairs_per_user: int = 1,
         request_ttl: timedelta = timedelta(hours=24),
+        invites: PairingInviteRepositoryPort | None = None,
+        invite_ttl: timedelta = timedelta(minutes=15),
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if max_pairs_per_user < 1:
             raise ValueError("max_pairs_per_user must be >= 1.")
         if request_ttl <= timedelta(0):
             raise ValueError("request_ttl must be positive.")
+        if invite_ttl <= timedelta(0):
+            raise ValueError("invite_ttl must be positive.")
         self._users = users
         self._pairs = pairs
         self._requests = requests
+        self._invites = invites
         self._tx = tx
         self._max_pairs_per_user = max_pairs_per_user
         self._request_ttl = request_ttl
+        self._invite_ttl = invite_ttl
         self._clock = clock or (lambda: datetime.now(UTC))
 
     @property
@@ -314,6 +378,11 @@ class PairingService:
     def request_ttl(self) -> timedelta:
         """Configured lifetime of a pending request."""
         return self._request_ttl
+
+    @property
+    def invite_ttl(self) -> timedelta:
+        """Configured lifetime of a cross-platform deep-link invite."""
+        return self._invite_ttl
 
     # ------------------------------------------------------------------ rules
 
@@ -410,6 +479,84 @@ class PairingService:
                 created_at=now,
                 expires_at=now + self._request_ttl,
             )
+
+    def create_invite(
+        self, inviter_id: int, target_platform: Platform
+    ) -> PairingInvite:
+        """Create a one-time deep-link invite to the opposite platform.
+
+        The caller (a bot) turns the returned token into
+        ``t.me/<bot>?start=<token>`` or ``ble.ir/<bot>?start=<token>``. The
+        first target user who opens that link consumes the invite and becomes
+        paired with the inviter automatically.
+
+        Raises:
+            RuntimeError: The invite repository was not configured.
+            SelfPairingError: The target platform equals the inviter's platform.
+            UserBannedError: The inviter is banned.
+            PairLimitReachedError: The inviter has no free pair slot.
+        """
+        if self._invites is None:  # pragma: no cover - production always wires it
+            raise RuntimeError("pairing invite repository is not configured")
+        now = self._clock()
+        with self._tx.transaction():
+            inviter = self._require_active_user(inviter_id, role="فرستنده")
+            if target_platform is inviter.platform:
+                raise SelfPairingError("برای جفت‌سازی باید پلتفرم مقابل را انتخاب کنید.")
+            self._ensure_capacity(inviter)
+            self._invites.invalidate_for_inviter(inviter.id, now)
+            return self._invites.create(
+                inviter_id=inviter.id,
+                target_platform=target_platform,
+                created_at=now,
+                expires_at=now + self._invite_ttl,
+            )
+
+    def consume_invite(self, token: str, target_user_id: int) -> Pair:
+        """Consume a deep-link invite and create the active pair immediately.
+
+        The invite is single-use and bound to the expected target platform. If
+        the two users are already paired, the existing pair is returned after
+        marking the invite used (idempotent double-click).
+
+        Raises:
+            RuntimeError: The invite repository was not configured.
+            PairInviteInvalidError: Unknown, expired, used, wrong-platform or
+                otherwise unusable invite.
+            PairLimitReachedError: Either user has no free pair slot.
+            UserBannedError: Either user is banned.
+        """
+        if self._invites is None:  # pragma: no cover - production always wires it
+            raise RuntimeError("pairing invite repository is not configured")
+        now = self._clock()
+        with self._tx.transaction():
+            invite = self._invites.get_by_token(token)
+            if invite is None or invite.is_used or invite.is_expired(now):
+                raise PairInviteInvalidError()
+            target = self._require_active_user(target_user_id, role="کاربر")
+            if target.platform is not invite.target_platform:
+                raise PairInviteInvalidError()
+            inviter = self._require_active_user(invite.inviter_id, role="فرستنده")
+            if inviter.platform is target.platform:
+                raise PairInviteInvalidError()
+
+            existing = self._pairs.find_active_between(inviter.id, target.id)
+            if existing is not None:
+                self._invites.mark_used(
+                    invite.id, used_by_id=target.id, used_at=now
+                )
+                return existing
+
+            self._ensure_capacity(inviter)
+            self._ensure_capacity(target)
+            pair = self._pairs.create(
+                user_a_id=min(inviter.id, target.id),
+                user_b_id=max(inviter.id, target.id),
+                status=PairingStatus.ACTIVE,
+                created_at=now,
+            )
+            self._invites.mark_used(invite.id, used_by_id=target.id, used_at=now)
+            return pair
 
     def accept(self, request_id: int, actor_id: int) -> Pair:
         """Accept a pending request, creating an active pair.

@@ -97,8 +97,8 @@ def two_pairs(repos: Repositories) -> tuple[int, int]:
 
 
 def test_fresh_database_is_migrated_to_latest_version(repos: Repositories) -> None:
-    assert repos.db.schema_version() == 4
-    assert repos.db.applied_versions() == (1, 2, 3, 4)
+    assert repos.db.schema_version() == 5
+    assert repos.db.applied_versions() == (1, 2, 3, 4, 5)
 
 
 def test_schema_contains_all_required_tables(repos: Repositories) -> None:
@@ -115,6 +115,7 @@ def test_schema_contains_all_required_tables(repos: Repositories) -> None:
         "messages",
         "outbox",
         "outbox_errors",
+        "pairing_invites",
         "poll_offsets",
         "schema_version",
     } <= names
@@ -134,13 +135,13 @@ def test_schema_contains_required_indexes(repos: Repositories) -> None:
 def test_schema_versions_are_recorded_exactly_once(repos: Repositories) -> None:
     total = sql(repos, "SELECT COUNT(*) AS total FROM schema_version").fetchone()["total"]
 
-    assert total == len(repos.db.applied_versions()) == 4
+    assert total == len(repos.db.applied_versions()) == 5
 
 
 def test_migrate_is_idempotent(repos: Repositories) -> None:
     before = repos.db.applied_versions()
 
-    assert repos.db.migrate() == 4
+    assert repos.db.migrate() == 5
     assert repos.db.applied_versions() == before
 
 
@@ -160,7 +161,7 @@ def test_reopening_a_file_database_keeps_data_and_skips_migrations(tmp_path: Pat
     second = Repositories.open(path)
     try:
         assert second.users.count() == 1
-        assert second.db.applied_versions() == (1, 2, 3, 4)
+        assert second.db.applied_versions() == (1, 2, 3, 4, 5)
     finally:
         second.close()
 
@@ -169,7 +170,7 @@ def test_in_memory_database_has_no_file() -> None:
     database = Database(":memory:")
     try:
         assert database.path == ":memory:"
-        assert database.schema_version() == 4
+        assert database.schema_version() == 5
     finally:
         database.close()
 
@@ -227,7 +228,7 @@ def test_migration_three_preserves_rows_and_backfills_timestamps(
 
     repos = Repositories.open(path)
     try:
-        assert repos.db.schema_version() == 4
+        assert repos.db.schema_version() == 5
         entry = repos.outbox.get_for_pair(1, 1)
         assert entry is not None
         assert entry.status is OutboxStatus.SENT
@@ -544,6 +545,49 @@ def test_pairing_repositories_expose_aggregates(with_users: Repositories) -> Non
 
     with_users.pairs.set_status(pair.id, PairingStatus.UNPAIRED, ended_at=NOW)
     assert with_users.pairs.count_active() == 0
+
+
+# ---------------------------------------------------------- pairing invites
+
+
+def test_pairing_invite_repository_lifecycle(with_users: Repositories) -> None:
+    invite = with_users.invites.create(
+        inviter_id=1,
+        target_platform=Platform.BALE,
+        created_at=NOW,
+        expires_at=NOW + timedelta(minutes=15),
+    )
+
+    assert len(invite.token) >= 20
+    assert invite.target_platform is Platform.BALE
+    assert with_users.invites.get_by_token(invite.token) == invite
+
+    assert with_users.invites.invalidate_for_inviter(1, NOW + timedelta(minutes=1)) == 1
+    invalidated = with_users.invites.get_by_token(invite.token)
+    assert invalidated is not None
+    assert invalidated.expires_at == NOW + timedelta(minutes=1)
+
+    used = with_users.invites.mark_used(
+        invite.id, used_by_id=2, used_at=NOW + timedelta(minutes=2)
+    )
+    assert used is not None and used.used_by_id == 2
+    assert with_users.invites.mark_used(
+        invite.id, used_by_id=3, used_at=NOW + timedelta(minutes=3)
+    ) is None
+
+
+def test_pairing_invite_tokens_are_unique(with_users: Repositories) -> None:
+    tokens = {
+        with_users.invites.create(
+            inviter_id=1,
+            target_platform=Platform.BALE,
+            created_at=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+        ).token
+        for _ in range(20)
+    }
+
+    assert len(tokens) == 20
 
 
 # ------------------------------------------------------------- poll offsets

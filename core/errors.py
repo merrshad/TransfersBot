@@ -120,6 +120,18 @@ class PairNotFoundError(DomainError):
         super().__init__(message)
 
 
+class PairInviteInvalidError(DomainError):
+    """Raised when a deep-link pairing invite is unknown, used or expired."""
+
+    code = "pair_invite_invalid"
+
+    def __init__(
+        self,
+        message: str = "لینک جفت‌سازی معتبر نیست یا منقضی شده است.",
+    ) -> None:
+        super().__init__(message)
+
+
 class NotRequestTargetError(DomainError):
     """Raised when someone other than the target accepts/rejects a request."""
 

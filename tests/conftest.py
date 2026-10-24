@@ -100,6 +100,8 @@ def pairing(repos: Repositories, clock: FakeClock) -> PairingService:
         repos.db,
         max_pairs_per_user=1,
         request_ttl=timedelta(hours=24),
+        invites=repos.invites,
+        invite_ttl=timedelta(minutes=15),
         clock=clock,
     )
 
@@ -107,7 +109,12 @@ def pairing(repos: Repositories, clock: FakeClock) -> PairingService:
 @pytest.fixture
 def router(users: UserService, pairing: PairingService) -> CommandRouter:
     """Command router wired to the default services."""
-    return CommandRouter(users, pairing)
+    return CommandRouter(
+        users,
+        pairing,
+        telegram_bot_username="TestTelegramBot",
+        bale_bot_username="TestBaleBot",
+    )
 
 
 @dataclass(frozen=True, slots=True)

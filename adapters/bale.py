@@ -162,7 +162,11 @@ def _inline_keyboard(
     """Translate the domain button grid into Bale's inline markup."""
     rows = [
         [
-            {"text": button.text, "callback_data": button.callback_data}
+            (
+                {"text": button.text, "url": button.url}
+                if button.url is not None
+                else {"text": button.text, "callback_data": button.callback_data}
+            )
             for button in row
         ]
         for row in buttons

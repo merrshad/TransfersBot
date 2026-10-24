@@ -26,9 +26,9 @@ from types import TracebackType
 from typing import Any, Literal
 
 from core.errors import DuplicateMessageError
-from core.ids import new_public_id
+from core.ids import new_pair_token, new_public_id
 from core.models import MessageRecord, OutboxEntry, OutboxStats, OutboxStatus, Platform
-from core.pairing import Pair, PairingStatus, PairRequest
+from core.pairing import Pair, PairingInvite, PairingStatus, PairRequest
 from core.users import User, UserRole, UserStatus
 
 # ------------------------------------------------------------------ time utils
@@ -246,6 +246,30 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE UNIQUE INDEX ux_users_public_id ON users (public_id)",
         ),
     ),
+    Migration(
+        version=5,
+        description="one-time cross-platform pairing invites",
+        statements=(
+            """
+            CREATE TABLE pairing_invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL,
+                inviter_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+                target_platform TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
+                used_by_id INTEGER REFERENCES users (id) ON DELETE SET NULL,
+                CONSTRAINT uq_pairing_invites_token UNIQUE (token),
+                CONSTRAINT ck_pairing_invites_platform CHECK (
+                    target_platform IN ('telegram', 'bale')
+                )
+            )
+            """,
+            "CREATE INDEX ix_pairing_invites_inviter ON pairing_invites (inviter_id, used_at)",
+            "CREATE INDEX ix_pairing_invites_expiry ON pairing_invites (expires_at)",
+        ),
+    ),
 )
 
 SCHEMA_VERSION_TABLE = "schema_version"
@@ -439,6 +463,21 @@ def _to_pair_request(row: sqlite3.Row) -> PairRequest:
         created_at=from_db_time(row["created_at"]),
         expires_at=from_db_time(row["expires_at"]),
         pair_id=int(pair_id) if pair_id is not None else None,
+    )
+
+
+def _to_pairing_invite(row: sqlite3.Row) -> PairingInvite:
+    used_at = row["used_at"]
+    used_by_id = row["used_by_id"]
+    return PairingInvite(
+        id=int(row["id"]),
+        token=str(row["token"]),
+        inviter_id=int(row["inviter_id"]),
+        target_platform=Platform(row["target_platform"]),
+        created_at=from_db_time(row["created_at"]),
+        expires_at=from_db_time(row["expires_at"]),
+        used_at=from_db_time(used_at) if used_at is not None else None,
+        used_by_id=int(used_by_id) if used_by_id is not None else None,
     )
 
 
@@ -859,6 +898,94 @@ class PairRequestRepository:
             (to_db_time(now),),
         )
         return int(cursor.rowcount)
+
+
+class PairingInviteRepository:
+    """SQLite implementation of :class:`core.pairing.PairingInviteRepositoryPort`."""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    @property
+    def _connection(self) -> sqlite3.Connection:
+        return self._db.connection
+
+    def create(
+        self,
+        *,
+        inviter_id: int,
+        target_platform: Platform,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> PairingInvite:
+        """Insert an invite, regenerating the token on the (astronomically rare) collision."""
+        for _ in range(10):
+            token = new_pair_token()
+            try:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO pairing_invites
+                        (token, inviter_id, target_platform, created_at, expires_at,
+                         used_at, used_by_id)
+                    VALUES (?, ?, ?, ?, ?, NULL, NULL)
+                    """,
+                    (
+                        token,
+                        inviter_id,
+                        target_platform.value,
+                        to_db_time(created_at),
+                        to_db_time(expires_at),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                continue
+            created = self.get(_last_row_id(cursor))
+            if created is None:  # pragma: no cover - insert just succeeded
+                raise RuntimeError("pairing invite disappeared right after insert")
+            return created
+        raise RuntimeError("could not allocate a unique pairing token")  # pragma: no cover
+
+    def get(self, invite_id: int) -> PairingInvite | None:
+        """Fetch an invite by internal id."""
+        row = self._connection.execute(
+            "SELECT * FROM pairing_invites WHERE id = ?", (invite_id,)
+        ).fetchone()
+        return _to_pairing_invite(row) if row is not None else None
+
+    def get_by_token(self, token: str) -> PairingInvite | None:
+        """Fetch an invite by its URL-safe token."""
+        row = self._connection.execute(
+            "SELECT * FROM pairing_invites WHERE token = ?", (token,)
+        ).fetchone()
+        return _to_pairing_invite(row) if row is not None else None
+
+    def invalidate_for_inviter(self, inviter_id: int, now: datetime) -> int:
+        """Expire every unused invite for ``inviter_id`` (one active link max)."""
+        cursor = self._connection.execute(
+            """
+            UPDATE pairing_invites
+            SET expires_at = ?
+            WHERE inviter_id = ? AND used_at IS NULL
+            """,
+            (to_db_time(now), inviter_id),
+        )
+        return int(cursor.rowcount)
+
+    def mark_used(
+        self, invite_id: int, *, used_by_id: int, used_at: datetime
+    ) -> PairingInvite | None:
+        """Mark an invite consumed; only the first caller wins."""
+        cursor = self._connection.execute(
+            """
+            UPDATE pairing_invites
+            SET used_at = ?, used_by_id = ?
+            WHERE id = ? AND used_at IS NULL
+            """,
+            (to_db_time(used_at), used_by_id, invite_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        return self.get(invite_id)
 
 
 # ------------------------------------------------------------------ messages
@@ -1446,6 +1573,7 @@ class Repositories:
     users: UserRepository
     pairs: PairRepository
     requests: PairRequestRepository
+    invites: PairingInviteRepository
     messages: MessageRepository
     outbox: OutboxRepository
     poll_offsets: PollOffsetRepository
@@ -1459,6 +1587,7 @@ class Repositories:
             users=UserRepository(database),
             pairs=PairRepository(database),
             requests=PairRequestRepository(database),
+            invites=PairingInviteRepository(database),
             messages=MessageRepository(database),
             outbox=OutboxRepository(database),
             poll_offsets=PollOffsetRepository(database),
@@ -1483,6 +1612,7 @@ __all__ = [
     "OutboxRepository",
     "PairRepository",
     "PairRequestRepository",
+    "PairingInviteRepository",
     "PollOffsetRepository",
     "Repositories",
     "UserRepository",

@@ -92,18 +92,30 @@ class MediaItem:
 
 @dataclass(frozen=True, slots=True)
 class InlineButton:
-    """One inline (glass) button in a message keyboard."""
+    """One inline (glass) button: either a callback or an external URL.
+
+    Exactly one of ``callback_data`` and ``url`` must be provided. URL buttons
+    are used for cross-bot deep links (Telegram ↔ Bale pairing).
+    """
 
     text: str
-    callback_data: str
+    callback_data: str | None = None
+    url: str | None = None
 
     def __post_init__(self) -> None:
         if not self.text.strip():
             raise ValueError("button text must not be blank.")
-        if not self.callback_data:
-            raise ValueError("callback_data must not be empty.")
-        if len(self.callback_data.encode("utf-8")) > 64:
-            raise ValueError("callback_data must be at most 64 bytes (Telegram limit).")
+        if (self.callback_data is None) == (self.url is None):
+            raise ValueError("an inline button needs exactly one of callback_data/url.")
+        if self.callback_data is not None:
+            if not self.callback_data:
+                raise ValueError("callback_data must not be empty.")
+            if len(self.callback_data.encode("utf-8")) > 64:
+                raise ValueError(
+                    "callback_data must be at most 64 bytes (Telegram limit)."
+                )
+        if self.url is not None and not self.url.startswith(("http://", "https://")):
+            raise ValueError("button url must be an http(s) URL.")
 
 
 @dataclass(frozen=True, slots=True)

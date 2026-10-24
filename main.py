@@ -122,8 +122,16 @@ def build_runtime(settings: Settings, repos: Repositories) -> Runtime:
         repos.db,
         max_pairs_per_user=settings.max_pairs_per_user,
         request_ttl=timedelta(hours=settings.pair_request_ttl_hours),
+        invites=repos.invites,
+        invite_ttl=timedelta(minutes=settings.pair_invite_ttl_minutes),
     )
-    router = CommandRouter(users, pairing, stats=repos.outbox.queue_stats)
+    router = CommandRouter(
+        users,
+        pairing,
+        stats=repos.outbox.queue_stats,
+        telegram_bot_username=settings.telegram_bot_username,
+        bale_bot_username=settings.bale_bot_username,
+    )
     owners = owner_platform_ids(settings)
     adapters: dict[Platform, BaseAdapter] = {
         Platform.TELEGRAM: TelegramAdapter(

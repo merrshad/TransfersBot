@@ -44,6 +44,9 @@ def test_defaults_match_specification() -> None:
     assert settings.outbox_retry_jitter == 0.2
     assert settings.outbox_media_timeout_terminal is True
     assert settings.outbox_sent_retention_days == 7
+    assert settings.telegram_bot_username == "Tele_to_Bale_RoBot"
+    assert settings.bale_bot_username == "bale2telrobot"
+    assert settings.pair_invite_ttl_minutes == 15
     assert settings.telegram_write_timeout_seconds == 600.0
     assert settings.user_messages_per_minute == 30
     assert settings.user_rate_limit_action == "queue"
@@ -89,6 +92,16 @@ def test_tokens_are_secret_and_never_rendered_in_repr() -> None:
 def test_blank_tokens_are_rejected(blank: str) -> None:
     with pytest.raises(ValidationError):
         make_settings(telegram_bot_token=blank)
+
+
+def test_bot_usernames_are_normalised() -> None:
+    settings = make_settings(
+        telegram_bot_username="@MyTelegramBot",
+        bale_bot_username=" MyBaleBot ",
+    )
+
+    assert settings.telegram_bot_username == "MyTelegramBot"
+    assert settings.bale_bot_username == "MyBaleBot"
 
 
 def test_base_url_trailing_slash_is_stripped() -> None:

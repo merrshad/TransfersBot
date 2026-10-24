@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import secrets
 
+from core.models import Platform
+
 PUBLIC_ID_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 PUBLIC_ID_LENGTH = 8
 PUBLIC_ID_MAX_LENGTH = 32
@@ -26,6 +28,31 @@ def new_public_id(length: int = PUBLIC_ID_LENGTH) -> str:
     if length < 4:
         raise ValueError("public id length must be >= 4")
     return "".join(secrets.choice(PUBLIC_ID_ALPHABET) for _ in range(length))
+
+
+def new_pair_token() -> str:
+    """Return a URL-safe one-time token for a pairing deep link.
+
+    Telegram's ``start`` payload allows ``A-Z a-z 0-9 _ -`` and at most 64
+    characters; ``token_urlsafe(18)`` is 24 characters and fits comfortably.
+    """
+    return secrets.token_urlsafe(18)
+
+
+def pair_deep_link(
+    platform: Platform, bot_username: str, token: str
+) -> str:
+    """Build the official bot deep link for ``platform``.
+
+    Telegram uses ``t.me/<bot>?start=...``; Bale documents the equivalent
+    ``ble.ir/<bot>?start=...`` link.
+    """
+    username = bot_username.strip().lstrip("@")
+    if not username:
+        raise ValueError("bot username must not be blank")
+    if platform is Platform.TELEGRAM:
+        return f"https://t.me/{username}?start={token}"
+    return f"https://ble.ir/{username}?start={token}"
 
 
 def normalise_public_id(value: str) -> str | None:
@@ -47,6 +74,8 @@ __all__ = [
     "PUBLIC_ID_ALPHABET",
     "PUBLIC_ID_LENGTH",
     "PUBLIC_ID_MAX_LENGTH",
+    "new_pair_token",
     "new_public_id",
     "normalise_public_id",
+    "pair_deep_link",
 ]

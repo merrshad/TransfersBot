@@ -13,6 +13,7 @@ from core.errors import (
     DuplicatePairRequestError,
     NotRequesterError,
     NotRequestTargetError,
+    PairInviteInvalidError,
     PairLimitReachedError,
     PairNotActiveError,
     PairNotFoundError,
@@ -78,6 +79,8 @@ def build(repos: Repositories, clock: FakeClock) -> Callable[..., Harness]:
             repos.db,
             max_pairs_per_user=max_pairs_per_user,
             request_ttl=timedelta(hours=ttl_hours),
+            invites=repos.invites,
+            invite_ttl=timedelta(minutes=15),
             clock=clock,
         )
         return Harness(repos=repos, clock=clock, users=users, pairing=pairing)
@@ -773,6 +776,79 @@ def test_pending_lists_are_per_user(build: Callable[..., Harness]) -> None:
     assert harness.pairing.incoming_requests(alice.id) == ()
     assert harness.pairing.outgoing_requests(dave.id) == ()
     assert harness.pairing.active_pairs(alice.id) == ()
+
+
+def test_deep_link_invite_pairs_the_first_user_on_the_target_platform(
+    build: Callable[..., Harness],
+) -> None:
+    harness = build()
+    telegram = harness.user(platform=Platform.TELEGRAM)
+    bale = harness.user(platform=Platform.BALE)
+
+    invite = harness.pairing.create_invite(telegram.id, Platform.BALE)
+    pair = harness.pairing.consume_invite(invite.token, bale.id)
+
+    assert pair.is_active
+    assert harness.pairing.active_pair(telegram.id) == pair
+    assert harness.pairing.active_pair(bale.id) == pair
+
+
+def test_invite_is_single_use(build: Callable[..., Harness]) -> None:
+    harness = build()
+    telegram = harness.user(platform=Platform.TELEGRAM)
+    first_bale = harness.user(platform=Platform.BALE)
+    second_bale = harness.user(platform=Platform.BALE)
+
+    invite = harness.pairing.create_invite(telegram.id, Platform.BALE)
+    harness.pairing.consume_invite(invite.token, first_bale.id)
+
+    with pytest.raises(PairInviteInvalidError):
+        harness.pairing.consume_invite(invite.token, second_bale.id)
+
+
+def test_invite_expires(build: Callable[..., Harness]) -> None:
+    harness = build()
+    telegram = harness.user(platform=Platform.TELEGRAM)
+    bale = harness.user(platform=Platform.BALE)
+    invite = harness.pairing.create_invite(telegram.id, Platform.BALE)
+
+    harness.clock.advance(minutes=16)
+
+    with pytest.raises(PairInviteInvalidError):
+        harness.pairing.consume_invite(invite.token, bale.id)
+
+
+def test_invite_is_bound_to_the_target_platform(build: Callable[..., Harness]) -> None:
+    harness = build()
+    telegram = harness.user(platform=Platform.TELEGRAM)
+    another_telegram = harness.user(platform=Platform.TELEGRAM)
+
+    invite = harness.pairing.create_invite(telegram.id, Platform.BALE)
+
+    with pytest.raises(PairInviteInvalidError):
+        harness.pairing.consume_invite(invite.token, another_telegram.id)
+
+
+def test_invite_cannot_target_the_inviters_own_platform(
+    build: Callable[..., Harness],
+) -> None:
+    harness = build()
+    telegram = harness.user(platform=Platform.TELEGRAM)
+
+    with pytest.raises(SelfPairingError):
+        harness.pairing.create_invite(telegram.id, Platform.TELEGRAM)
+
+
+def test_invite_creator_must_have_a_free_pair_slot(
+    build: Callable[..., Harness],
+) -> None:
+    harness = build(max_pairs_per_user=1)
+    telegram = harness.user(platform=Platform.TELEGRAM)
+    bale = harness.user(platform=Platform.BALE)
+    harness.pair(telegram, bale)
+
+    with pytest.raises(PairLimitReachedError):
+        harness.pairing.create_invite(telegram.id, Platform.BALE)
 
 
 def test_pair_request_object_exposes_helper_properties() -> None:

@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     max_users: int = Field(default=0, ge=0, description="0 means unlimited.")
     max_pairs_per_user: int = Field(default=1, ge=1)
     pair_request_ttl_hours: int = Field(default=24, ge=1)
+    # Public bot usernames used to build t.me / ble.ir deep links.
+    telegram_bot_username: str = "Tele_to_Bale_RoBot"
+    bale_bot_username: str = "bale2telrobot"
+    pair_invite_ttl_minutes: int = Field(default=15, ge=1)
     db_path: Path = Path("data/bridge.db")
     log_level: LogLevel = "INFO"
     poll_timeout_seconds: int = Field(default=25, ge=1, le=300)
@@ -116,6 +120,15 @@ class Settings(BaseSettings):
         candidate = value.strip().rstrip("/")
         if not candidate.startswith(("http://", "https://")):
             raise ValueError("BALE_API_BASE_URL must start with http:// or https://")
+        return candidate
+
+    @field_validator("telegram_bot_username", "bale_bot_username")
+    @classmethod
+    def _normalise_bot_username(cls, value: str) -> str:
+        """Accept ``@Name`` or ``Name`` and store the bare username."""
+        candidate = value.strip().lstrip("@")
+        if not candidate:
+            raise ValueError("bot username must not be empty")
         return candidate
 
 

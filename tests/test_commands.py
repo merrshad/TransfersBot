@@ -196,6 +196,53 @@ def test_ban_and_unban_use_the_public_id(
     assert users.get(target.id).is_active
 
 
+def test_pair_button_builds_a_deep_link_and_start_consumes_it(
+    router: CommandRouter, register, repos: Repositories
+) -> None:
+    telegram = register(platform=Platform.TELEGRAM)
+
+    (offer,) = router.handle_callback(telegram.id, "menu:pair")
+    url_button = offer.buttons[0][0]
+    assert url_button.url is not None
+    assert url_button.url.startswith("https://ble.ir/TestBaleBot?start=")
+    token = url_button.url.rsplit("start=", 1)[1]
+
+    bale = register(platform=Platform.BALE)
+    actions = router.handle(bale.id, f"/start {token}")
+
+    assert "اتصال برقرار شد" in actions[0].text
+    assert repos.pairs.count_active() == 1
+    assert repos.pairs.find_active_between(telegram.id, bale.id) is not None
+
+
+def test_pair_deep_link_works_in_the_reverse_direction(
+    router: CommandRouter, register, repos: Repositories
+) -> None:
+    bale = register(platform=Platform.BALE)
+
+    (offer,) = router.handle(bale.id, "/pair")
+    url = offer.buttons[0][0].url
+    assert url is not None and url.startswith("https://t.me/TestTelegramBot?start=")
+    token = url.rsplit("start=", 1)[1]
+
+    telegram = register(platform=Platform.TELEGRAM)
+    actions = router.handle(telegram.id, f"/start {token}")
+
+    assert "اتصال برقرار شد" in actions[0].text
+    assert repos.pairs.find_active_between(telegram.id, bale.id) is not None
+
+
+def test_invalid_pairing_token_shows_a_clear_error(
+    router: CommandRouter, register
+) -> None:
+    actor = register(platform=Platform.TELEGRAM)
+
+    (action,) = router.handle(actor.id, "/start not-a-valid-token")
+
+    assert "معتبر نیست" in action.text
+    assert "جفت‌سازی" in action.text
+
+
 def test_owner_ban_callback_uses_the_public_id(
     router: CommandRouter, register, users: UserService
 ) -> None:
@@ -247,7 +294,8 @@ def test_pair_argument_errors(router: CommandRouter, register, repos) -> None:
     (missing,) = router.handle(actor.id, "/pair")
     (not_a_number,) = router.handle(actor.id, "/pair abc")
 
-    assert "/pair <شناسه کاربر>" in missing.text
+    assert "لینک" in missing.text
+    assert missing.buttons[0][0].url is not None
     assert "abc" in not_a_number.text
     assert repos.requests.list_pending_outgoing(actor.id) == ()
 
