@@ -36,6 +36,7 @@ from core.errors import (
     RateLimitError,
     TransportError,
 )
+from core.groups import GroupMessageRepositoryPort
 from core.media import (
     RELAY_MEDIA_KIND,
     STICKER_PLACEHOLDER,
@@ -74,6 +75,8 @@ from core.users import UserService
 
 #: Payload discriminator written by the bridge (``outbox.payload["kind"]``).
 RELAY_PAYLOAD_KIND = "relay_text"
+GROUP_TEXT_PAYLOAD_KIND = "relay_group_text"
+GROUP_MEDIA_PAYLOAD_KIND = "relay_group_media"
 
 #: How long a malformed payload error string may grow (log/DB hygiene).
 _MAX_ERROR_LENGTH = 200
@@ -134,6 +137,8 @@ class _MediaJob:
     target_user_id: int
     target_chat_id: int
     target_platform: Platform
+    group_link_id: int | None = None
+    source_chat_id: int | None = None
     spooled: list[Path] = field(default_factory=list)
     notice: str | None = None
 
@@ -235,6 +240,7 @@ class OutboxWorker:
         outbox: OutboxRepositoryPort,
         tx: TransactionManager,
         senders: Mapping[Platform, MessageSenderPort],
+        group_messages: GroupMessageRepositoryPort | None = None,
         clock: Callable[[], datetime] | None = None,
         retry_delay: timedelta = timedelta(seconds=10),
         max_attempts: int = 5,
@@ -271,6 +277,7 @@ class OutboxWorker:
         self._outbox = outbox
         self._tx = tx
         self._senders = dict(senders)
+        self._group_messages = group_messages
         self._clock = clock or (lambda: datetime.now(UTC))
         self._retry = retry_policy or RetryPolicy(
             base_delay=retry_delay, max_attempts=max_attempts
@@ -411,7 +418,10 @@ class OutboxWorker:
 
     async def _deliver_entry(self, entry: OutboxEntry) -> str:
         """Deliver one entry; returns ``delivered``/``retried``/``failed``/``skipped``."""
-        if entry.payload.get("kind") == RELAY_MEDIA_KIND:
+        kind = entry.payload.get("kind")
+        if kind == GROUP_TEXT_PAYLOAD_KIND:
+            return await self._deliver_group_text(entry)
+        if kind in {RELAY_MEDIA_KIND, GROUP_MEDIA_PAYLOAD_KIND}:
             return (await self._deliver_album((entry,)))[0]
 
         resolved = self._resolve_delivery(entry)
@@ -455,6 +465,72 @@ class OutboxWorker:
         self._mark_delivered(entry, sent)
         return "delivered"
 
+    def _group_rate_key(self, payload: Mapping[str, object]) -> int | None:
+        """Rate-limit group senders without colliding across platforms."""
+        user_id = _optional_int(payload.get("source_user_id"))
+        if user_id is None:
+            return _optional_int(payload.get("target_chat_id"))
+        if payload.get("source_platform") == Platform.BALE.value:
+            return -user_id
+        return user_id
+
+    def _resolve_group_target(
+        self, entry: OutboxEntry
+    ) -> tuple[MessageSenderPort, int] | str:
+        """Validate a group payload and resolve its target sender/chat."""
+        payload = entry.payload
+        platform = _platform_or_none(payload.get("target_platform"))
+        chat_id = _optional_int(payload.get("target_chat_id"))
+        if platform is None or chat_id is None:
+            return "malformed group payload: missing target"
+        sender = self._senders.get(platform)
+        if sender is None:
+            return f"no sender configured for platform={platform.value}"
+        text = payload.get("text")
+        if not isinstance(text, str) or not text:
+            return "malformed group payload: missing text"
+        return sender, chat_id
+
+    async def _deliver_group_text(self, entry: OutboxEntry) -> str:
+        """Deliver one text message to the linked group."""
+        resolved = self._resolve_group_target(entry)
+        if isinstance(resolved, str):
+            self._mark_terminal(entry, resolved)
+            return "failed"
+        sender, chat_id = resolved
+        decision = self._rate_limiter.check(
+            platform=sender.platform,
+            chat_id=chat_id,
+            user_id=self._group_rate_key(entry.payload),
+            now=self._clock(),
+        )
+        if not decision.allowed:
+            return await self._rate_limited_entry(entry, decision)
+
+        try:
+            sent = await sender.send_message(
+                chat_id,
+                str(entry.payload.get("text", "")),
+                reply_to_message_id=_optional_int(
+                    entry.payload.get("reply_to_message_id")
+                ),
+            )
+        except MessagingError as exc:
+            return "failed" if self._mark_failure(entry, exc) else "retried"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return (
+                "failed"
+                if self._mark_failure(
+                    entry,
+                    f"unexpected {type(exc).__name__} from the platform sender",
+                )
+                else "retried"
+            )
+        self._mark_delivered(entry, sent)
+        return "delivered"
+
     # ----------------------------------------------------------------- media
 
     async def _deliver_album(
@@ -480,13 +556,23 @@ class OutboxWorker:
         if not jobs:
             return tuple(outcomes.get(entry.id, "skipped") for entry in entries)
 
-        target = self._users.get(jobs[0].target_user_id)
-        sender = self._senders.get(target.platform) if target is not None else None
-        if target is None or sender is None:
+        is_group = jobs[0].group_link_id is not None
+        target = None if is_group else self._users.get(jobs[0].target_user_id)
+        target_platform = (
+            jobs[0].target_platform if is_group else (target.platform if target else None)
+        )
+        sender = (
+            self._senders.get(target_platform) if target_platform is not None else None
+        )
+        if (target is None and not is_group) or sender is None or target_platform is None:
             reason = (
                 f"unknown target user_id={jobs[0].target_user_id}"
-                if target is None
-                else f"no sender configured for platform={target.platform.value}"
+                if target is None and not is_group
+                else (
+                    f"no sender configured for platform={target_platform.value}"
+                    if target_platform is not None
+                    else "unknown target platform"
+                )
             )
             for job in jobs:
                 self._mark_terminal(job.entry, reason)
@@ -499,9 +585,13 @@ class OutboxWorker:
         # platform/chat/user unit. A standalone attachment is its own group and
         # therefore its own unit.
         decision = self._rate_limiter.check(
-            platform=target.platform,
+            platform=target_platform,
             chat_id=jobs[0].target_chat_id,
-            user_id=jobs[0].source_user_id or jobs[0].target_user_id,
+            user_id=(
+                self._group_rate_key(jobs[0].entry.payload)
+                if is_group
+                else (jobs[0].source_user_id or jobs[0].target_user_id)
+            ),
             now=self._clock(),
         )
         if not decision.allowed:
@@ -509,22 +599,20 @@ class OutboxWorker:
                 for job in jobs:
                     self._mark_terminal(job.entry, RATE_LIMIT_REJECT_ERROR)
                     outcomes[job.entry.id] = "failed"
-                await self._notify_rate_limit(
-                    {"source_user_id": jobs[0].source_user_id}, decision
-                )
+                await self._notify_rate_limit(jobs[0].entry.payload, decision)
                 self._cleanup(jobs)
             else:
                 self._defer_jobs(jobs, decision)
                 for job in jobs:
                     outcomes[job.entry.id] = "deferred"
-                await self._notify_rate_limit(
-                    {"source_user_id": jobs[0].source_user_id}, decision
-                )
+                await self._notify_rate_limit(jobs[0].entry.payload, decision)
             return tuple(outcomes.get(entry.id, "skipped") for entry in entries)
 
         try:
             try:
-                prepared, placeholders = await self._prepare_items(jobs, target.platform)
+                prepared, placeholders = await self._prepare_items(
+                    jobs, target_platform
+                )
             except _TransientMediaError as exc:
                 for job in jobs:
                     terminal = self._mark_failure(job.entry, exc.error)
@@ -539,7 +627,7 @@ class OutboxWorker:
                     outcomes[job.entry.id] = "failed"
                     await self._notify_source(job, job.notice)
 
-            await self._send_prepared(prepared, placeholders, outcomes, target.platform)
+            await self._send_prepared(prepared, placeholders, outcomes, target_platform)
             for job in jobs:
                 outcomes.setdefault(job.entry.id, "skipped")
             return tuple(outcomes.get(entry.id, "skipped") for entry in entries)
@@ -824,14 +912,13 @@ class OutboxWorker:
         outcomes[job.entry.id] = "delivered"
 
     def _resolve_media_job(self, entry: OutboxEntry) -> _MediaJob | str:
-        """Validate a media payload; returns a job or a terminal error string."""
+        """Validate a pair or group media payload; returns a job or error string."""
         payload = entry.payload
-        target_user_id = _optional_int(payload.get("target_user_id"))
+        is_group = payload.get("kind") == GROUP_MEDIA_PAYLOAD_KIND
         target_chat_id = _optional_int(payload.get("target_chat_id"))
         raw_items = payload.get("items")
         if (
-            target_user_id is None
-            or target_chat_id is None
+            target_chat_id is None
             or not isinstance(raw_items, Sequence)
             or isinstance(raw_items, str)
             or not raw_items
@@ -842,9 +929,30 @@ class OutboxWorker:
             return f"{MALFORMED_MEDIA_ERROR}: unknown source platform"
         if self._store is None:
             return NO_SPOOL_ERROR
-        user = self._users.get(target_user_id)
-        if user is None:
-            return f"unknown target user_id={target_user_id}"
+
+        group_link_id: int | None = None
+        source_chat_id: int | None = None
+        target_user_id: int | None
+        if is_group:
+            group_link_id = _optional_int(payload.get("group_link_id"))
+            target_platform = _platform_or_none(payload.get("target_platform"))
+            if group_link_id is None or target_platform is None:
+                return f"{MALFORMED_MEDIA_ERROR}: invalid group target"
+            # Negative ids keep each group's spool files under a distinct
+            # directory without creating synthetic user accounts.
+            target_user_id = -group_link_id
+            source_chat_id = _optional_int(payload.get("source_chat_id"))
+        else:
+            target_user_id = _optional_int(payload.get("target_user_id"))
+            if target_user_id is None:
+                return MALFORMED_MEDIA_ERROR
+            user = self._users.get(target_user_id)
+            if user is None:
+                return f"unknown target user_id={target_user_id}"
+            target_platform = user.platform
+
+        if target_user_id is None:  # pragma: no cover - guarded above
+            return MALFORMED_MEDIA_ERROR
         try:
             items = tuple(media_item_from_payload(raw) for raw in raw_items)
         except ValueError as exc:
@@ -855,7 +963,8 @@ class OutboxWorker:
             entry=entry,
             items=items,
             plans=tuple(
-                plan_media_delivery(item, user.platform, self._policy) for item in items
+                plan_media_delivery(item, target_platform, self._policy)
+                for item in items
             ),
             text=text if isinstance(text, str) and text else None,
             reply_to_message_id=_optional_int(payload.get("reply_to_message_id")),
@@ -863,7 +972,9 @@ class OutboxWorker:
             source_user_id=_optional_int(payload.get("source_user_id")),
             target_user_id=target_user_id,
             target_chat_id=target_chat_id,
-            target_platform=user.platform,
+            target_platform=target_platform,
+            group_link_id=group_link_id,
+            source_chat_id=source_chat_id,
         )
 
     def _cleanup(self, jobs: Sequence[_MediaJob], *, keep: bool = False) -> None:
@@ -876,16 +987,24 @@ class OutboxWorker:
             job.spooled.clear()
 
     async def _notify_source(self, job: _MediaJob, reason: str) -> None:
-        """Tell the sender why their file was not relayed (ids and sizes only)."""
-        if job.source_user_id is None:
-            return
+        """Tell the sender (or source group) why a file was not relayed."""
         sender = self._senders.get(job.source_platform)
         if sender is None:
             return
-        user = self._users.get(job.source_user_id)
-        chat_id = (
-            (user.last_chat_id or user.platform_user_id) if user is not None else None
-        )
+        chat_id: int | None
+        if job.group_link_id is not None:
+            if job.source_chat_id is None:
+                return
+            chat_id = job.source_chat_id
+        else:
+            if job.source_user_id is None:
+                return
+            user = self._users.get(job.source_user_id)
+            chat_id = (
+                (user.last_chat_id or user.platform_user_id)
+                if user is not None
+                else None
+            )
         if chat_id is None:
             return
         try:
@@ -894,8 +1013,8 @@ class OutboxWorker:
             )
         except MessagingError as exc:
             self._log.warning(
-                "media notice to user_id=%s failed (%s)",
-                job.source_user_id,
+                "media notice to %s failed (%s)",
+                "group" if job.group_link_id is not None else "user",
                 type(exc).__name__,
             )
 
@@ -945,18 +1064,25 @@ class OutboxWorker:
     def _mark_delivered(self, entry: OutboxEntry, sent: SentMessage) -> None:
         """Mark the entry sent and remember the delivered platform message id."""
         message_id = _optional_int(entry.payload.get("message_id"))
+        is_group = entry.group_link_id is not None
         with self._tx.transaction():
             self._outbox.mark_sent(
                 entry.pair_id, entry.id, sent_at=self._clock()
             )
             if message_id is not None:
-                self._messages.attach_target_message(
-                    entry.pair_id, message_id, sent.message_id
-                )
+                if is_group and self._group_messages is not None:
+                    self._group_messages.attach_target_message(
+                        message_id, sent.message_id
+                    )
+                elif not is_group:
+                    self._messages.attach_target_message(
+                        entry.pair_id, message_id, sent.message_id
+                    )
         self._log.info(
-            "outbox delivered entry_id=%s pair_id=%s target_message_id=%s",
+            "outbox delivered entry_id=%s pair_id=%s group_link_id=%s target_message_id=%s",
             entry.id,
             entry.pair_id,
+            entry.group_link_id,
             sent.message_id,
         )
 
@@ -1057,7 +1183,10 @@ class OutboxWorker:
         """A media timeout may mean the platform already accepted the upload."""
         if not self._media_timeout_terminal:
             return False
-        if entry.payload.get("kind") != RELAY_MEDIA_KIND:
+        if entry.payload.get("kind") not in {
+            RELAY_MEDIA_KIND,
+            GROUP_MEDIA_PAYLOAD_KIND,
+        }:
             return False
         if not isinstance(error, TransportError):
             return False
@@ -1118,6 +1247,10 @@ class OutboxWorker:
     ) -> None:
         """Send at most one guidance message per cooldown to a throttled user."""
         if decision.scope != SCOPE_USER:
+            return
+        if payload.get("group_link_id") is not None:
+            # A group sender's platform id is not a local user id; never look
+            # it up in the users table or a notice could reach the wrong person.
             return
         source_user_id = _optional_int(payload.get("source_user_id"))
         if source_user_id is None:

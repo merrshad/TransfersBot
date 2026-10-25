@@ -206,6 +206,19 @@ def _mapping(value: object) -> Mapping[str, Any] | None:
     return value if isinstance(value, Mapping) else None
 
 
+def _sender_name(sender: Mapping[str, Any]) -> str:
+    """Human-readable sender label for group bridging."""
+    name = " ".join(
+        part
+        for part in (
+            _as_str(sender.get("first_name")),
+            _as_str(sender.get("last_name")),
+        )
+        if part
+    ).strip()
+    return name or _as_str(sender.get("username")) or "کاربر"
+
+
 def _media_from_object(
     raw: Mapping[str, Any], kind: MediaKind, *, mime_default: str | None = None
 ) -> MediaItem | None:
@@ -340,13 +353,23 @@ def parse_update(raw: Mapping[str, Any]) -> UnifiedMessage | None:
             ),
             callback_data=data,
             callback_id=callback_id,
+            chat_type=(
+                _as_str(chat.get("type")) if chat is not None else "private"
+            )
+            or "private",
+            sender_name=_sender_name(sender),
+            is_bot_sender=bool(sender.get("is_bot", False)),
         )
 
     message = raw.get("message")
     if not isinstance(message, Mapping):
         return None
     chat = message.get("chat")
-    if not isinstance(chat, Mapping) or chat.get("type") != "private":
+    if not isinstance(chat, Mapping) or chat.get("type") not in {
+        "private",
+        "group",
+        "supergroup",
+    }:
         return None
     chat_id = chat.get("id")
     message_id = message.get("message_id")
@@ -404,6 +427,9 @@ def parse_update(raw: Mapping[str, Any]) -> UnifiedMessage | None:
         timestamp=_message_timestamp(message.get("date")),
         media_group_id=media_group_id,
         unsupported=unsupported,
+        chat_type=_as_str(chat.get("type")) or "private",
+        sender_name=_sender_name(sender),
+        is_bot_sender=bool(sender.get("is_bot", False)),
     )
 
 

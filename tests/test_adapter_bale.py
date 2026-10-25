@@ -117,6 +117,19 @@ def test_parse_update_converts_private_text_message() -> None:
     assert message.key == ("bale", 7001, 21)
 
 
+def test_parse_update_converts_group_message_with_sender_label() -> None:
+    raw = bale_message(chat_type="group", chat_id=4497595490, message_id=33)
+    raw["message"]["from"]["first_name"] = "مهدی"
+
+    message = parse_update(raw)
+
+    assert message is not None
+    assert message.chat_type == "group"
+    assert message.is_group is True
+    assert message.chat_id == 4497595490
+    assert message.sender_name == "مهدی"
+
+
 def test_parse_update_converts_callback_query() -> None:
     message = parse_update(bale_callback(data="menu:pair"))
 
@@ -160,7 +173,7 @@ def test_parse_update_keeps_reply_reference_and_entities() -> None:
     [
         {"update_id": 1},  # non-message update
         bale_message(text=None),  # media only
-        bale_message(chat_type="group"),
+        bale_message(chat_type="channel"),
         bale_message(with_sender=False),  # Bale documents "from" as optional
         {"update_id": 1, "message": {"message_id": 1, "chat": {"id": 1, "type": "private"}, "text": "x"}},
     ],
@@ -345,7 +358,7 @@ async def test_get_updates_parses_and_advances_offset() -> None:
     updates = [
         bale_message(update_id=3),
         bale_message(update_id=4, text=None),
-        bale_message(update_id=5, chat_type="group"),
+        bale_message(update_id=5, chat_type="channel"),
     ]
     adapter, _ = build_adapter(ok(updates))
 

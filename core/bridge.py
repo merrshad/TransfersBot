@@ -38,9 +38,18 @@ from core.commands import (
     SendMessageAction,
     parse_command,
 )
-from core.delivery import RELAY_PAYLOAD_KIND
+from core.delivery import (
+    GROUP_MEDIA_PAYLOAD_KIND,
+    GROUP_TEXT_PAYLOAD_KIND,
+    RELAY_PAYLOAD_KIND,
+)
 from core.errors import DomainError, DuplicateMessageError, MessagingError, UserBannedError
 from core.formatting import render_relay_text
+from core.groups import (
+    GroupLinkRepositoryPort,
+    GroupMessageRepositoryPort,
+    GroupOutboxRepositoryPort,
+)
 from core.media import RELAY_MEDIA_KIND, media_item_payload, unsupported_placeholder
 from core.models import MessageRef, Platform, SentMessage, UnifiedMessage
 from core.pairing import Pair, PairingService
@@ -90,6 +99,9 @@ class Bridge:
         tx: TransactionManager,
         senders: Mapping[Platform, MessageSenderPort],
         owner_platform_ids: Mapping[Platform, int],
+        group_links: GroupLinkRepositoryPort | None = None,
+        group_messages: GroupMessageRepositoryPort | None = None,
+        group_outbox: GroupOutboxRepositoryPort | None = None,
         clock: Callable[[], datetime] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -101,6 +113,9 @@ class Bridge:
         self._tx = tx
         self._senders = dict(senders)
         self._owner_platform_ids = dict(owner_platform_ids)
+        self._group_links = group_links
+        self._group_messages = group_messages
+        self._group_outbox = group_outbox
         self._clock = clock or (lambda: datetime.now(UTC))
         self._log = logger or logging.getLogger("bridge.core")
 
@@ -120,6 +135,9 @@ class Bridge:
         if not messages:
             return
         leader = messages[0]
+        if leader.is_group:
+            await self._handle_group_messages(messages)
+            return
         user = await self._register(leader)
         if user is None:
             if leader.callback_id is not None:
@@ -165,6 +183,220 @@ class Bridge:
         if not relayable:
             return
         await self._handle_content(user, relayable)
+
+    async def _handle_group_messages(
+        self, messages: Sequence[UnifiedMessage]
+    ) -> None:
+        """Relay one group message/album through the group link queue."""
+        if (
+            self._group_links is None
+            or self._group_messages is None
+            or self._group_outbox is None
+        ):
+            return
+
+        leader = messages[0]
+        if leader.is_bot_sender:
+            return
+        link = self._group_links.get_active_for_source(
+            leader.source, leader.chat_id
+        )
+        if link is None:
+            return
+
+        batch = tuple(
+            message
+            for message in self._same_album_members(leader, messages)
+            if not message.is_bot_sender and message.is_relayable
+        )
+        if not batch:
+            return
+        if (
+            not leader.media
+            and leader.text
+            and leader.text.lstrip().startswith("/")
+        ):
+            # Group commands are setup/administration, never relayed.
+            return
+
+        fresh = tuple(
+            message
+            for message in batch
+            if self._group_messages.find_by_source(
+                message.source, message.chat_id, message.message_id
+            )
+            is None
+        )
+        if not fresh:
+            self._log.info(
+                "group relay skipped reason=duplicate link_id=%s chat_id=%s",
+                link.id,
+                leader.chat_id,
+            )
+            return
+
+        target_platform, target_chat_id = link.target_for(leader.source)
+        album_id = self._group_album_id(fresh)
+        now = self._clock()
+        queued = 0
+        try:
+            with self._tx.transaction():
+                pending: list[tuple[UnifiedMessage, int]] = []
+                for message in fresh:
+                    record, created = self._group_messages.add(
+                        group_link_id=link.id,
+                        source_platform=message.source,
+                        source_chat_id=message.chat_id,
+                        source_message_id=message.message_id,
+                        created_at=message.timestamp,
+                    )
+                    if created:
+                        pending.append((message, record.id))
+                for index, (message, record_id) in enumerate(pending):
+                    self._group_outbox.enqueue(
+                        group_link_id=link.id,
+                        payload=self._group_payload(
+                            link_id=link.id,
+                            message=message,
+                            record_id=record_id,
+                            target_platform=target_platform,
+                            target_chat_id=target_chat_id,
+                            album_id=album_id,
+                            album_index=index,
+                            album_size=len(pending),
+                        ),
+                        next_attempt_at=now,
+                        created_at=now,
+                    )
+                    queued += 1
+        except Exception as exc:  # noqa: BLE001 - a poison group message must not kill polling
+            self._log.error(
+                "group relay failed reason=%s link_id=%s chat_id=%s",
+                type(exc).__name__,
+                link.id,
+                leader.chat_id,
+            )
+            return
+
+        if queued:
+            self._log.info(
+                "group relay queued link_id=%s from_chat=%s to_chat=%s messages=%s album=%s",
+                link.id,
+                leader.chat_id,
+                target_chat_id,
+                queued,
+                album_id is not None,
+            )
+
+    def _group_album_id(
+        self, messages: Sequence[UnifiedMessage]
+    ) -> str | None:
+        """Stable album key for group media groups."""
+        if len(messages) < 2:
+            return None
+        group_ids = {message.media_group_id for message in messages}
+        if len(group_ids) != 1 or None in group_ids:
+            return None
+        leader = messages[0]
+        return f"{leader.source.value}:{leader.chat_id}:{leader.media_group_id}"
+
+    @staticmethod
+    def _group_sender_label(name: str | None) -> str:
+        """Sanitise a group sender name for a safe one-line prefix."""
+        raw = " ".join((name or "کاربر").split())
+        cleaned = "".join(
+            char for char in raw if char not in {"*", "_", "`", "[", "]"}
+        )
+        return (cleaned[:64] or "کاربر").strip()
+
+    @classmethod
+    def _group_text(cls, sender: str, body: str) -> str:
+        """Prefix a text relay with its group sender."""
+        return f"👤 {sender}:\n{body}" if body else f"👤 {sender}"
+
+    @classmethod
+    def _group_caption(cls, sender: str, caption: str) -> str:
+        """Prefix a media caption with its group sender."""
+        return f"👤 {sender}: {caption}" if caption else f"👤 {sender}"
+
+    def _group_payload(
+        self,
+        *,
+        link_id: int,
+        message: UnifiedMessage,
+        record_id: int,
+        target_platform: Platform,
+        target_chat_id: int,
+        album_id: str | None,
+        album_index: int,
+        album_size: int,
+    ) -> dict[str, object]:
+        """Payload for one queued group message (ids + rendered content)."""
+        sender = self._group_sender_label(message.sender_name)
+        rendered = render_relay_text(
+            message.text or "", message.entities, target_platform
+        )
+        payload: dict[str, object] = {
+            "message_id": record_id,
+            "group_link_id": link_id,
+            "target_platform": target_platform.value,
+            "target_chat_id": target_chat_id,
+            "source_platform": message.source.value,
+            "source_chat_id": message.chat_id,
+            "source_user_id": message.sender_id,
+            "source_message_id": message.message_id,
+            "sender_name": sender,
+            "reply_to_message_id": self._group_reply_reference(link_id, message),
+        }
+        if message.media:
+            payload.update(
+                kind=GROUP_MEDIA_PAYLOAD_KIND,
+                text=self._group_caption(sender, rendered),
+                items=[media_item_payload(item) for item in message.media],
+            )
+        elif message.unsupported is not None:
+            payload.update(
+                kind=GROUP_TEXT_PAYLOAD_KIND,
+                text=self._group_text(
+                    sender, unsupported_placeholder(message.unsupported)
+                ),
+            )
+        else:
+            payload.update(
+                kind=GROUP_TEXT_PAYLOAD_KIND,
+                text=self._group_text(sender, rendered),
+            )
+        if album_id is not None:
+            payload["album_id"] = album_id
+            payload["album_index"] = album_index
+            payload["album_size"] = album_size
+        return payload
+
+    def _group_reply_reference(
+        self, link_id: int, message: UnifiedMessage
+    ) -> int | None:
+        """Map a reply in one group to the anchor id in the other group."""
+        if message.reply_to is None or self._group_messages is None:
+            return None
+        if message.source is Platform.TELEGRAM:
+            partner_platform = Platform.BALE
+        else:
+            partner_platform = Platform.TELEGRAM
+        link = self._group_links.get(link_id) if self._group_links else None
+        if link is None:
+            return None
+        partner_chat = (
+            link.bale_chat_id
+            if partner_platform is Platform.BALE
+            else link.telegram_chat_id
+        )
+        record = self._group_messages.find_by_target_in_link(
+            link_id,
+            source_platform=partner_platform,
+            source_chat_id=partner_chat,
+            target_message_id=message.reply_to.message_id,
+        )
+        return record.source_message_id if record is not None else None
 
     def _same_album_members(
         self, leader: UnifiedMessage, messages: Sequence[UnifiedMessage]

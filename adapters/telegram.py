@@ -347,6 +347,17 @@ def _textual_fallback(message: Message) -> str | None:
     return None
 
 
+def _sender_name(sender: object) -> str:
+    """Human-readable sender label for group bridging (never a token/content)."""
+    full_name = getattr(sender, "full_name", None)
+    if isinstance(full_name, str) and full_name.strip():
+        return full_name.strip()
+    username = getattr(sender, "username", None)
+    if isinstance(username, str) and username.strip():
+        return username.strip()
+    return "کاربر"
+
+
 def to_unified_message(update: Update) -> UnifiedMessage | None:
     """Convert one Telegram update into a :class:`UnifiedMessage`.
 
@@ -377,13 +388,16 @@ def to_unified_message(update: Update) -> UnifiedMessage | None:
             or datetime.now(UTC),
             callback_data=callback.data,
             callback_id=callback.id,
+            chat_type=getattr(chat, "type", "private") if chat is not None else "private",
+            sender_name=_sender_name(callback.from_user),
+            is_bot_sender=bool(getattr(callback.from_user, "is_bot", False)),
         )
 
     message: Message | None = update.effective_message
     if message is None:
         return None
     chat = message.chat
-    if chat is None or chat.type != "private":
+    if chat is None or chat.type not in {"private", "group", "supergroup"}:
         return None
     sender = message.from_user
     if sender is None:
@@ -425,6 +439,9 @@ def to_unified_message(update: Update) -> UnifiedMessage | None:
         timestamp=message.date or datetime.now(UTC),
         media_group_id=str(message.media_group_id) if message.media_group_id else None,
         unsupported=unsupported,
+        chat_type=chat.type,
+        sender_name=_sender_name(sender),
+        is_bot_sender=bool(getattr(sender, "is_bot", False)),
     )
 
 

@@ -11,7 +11,7 @@ import logging
 import signal
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from adapters.bale import BaleAdapter
 from adapters.base import BaseAdapter
@@ -55,6 +55,7 @@ class Runtime:
     router: CommandRouter
     bridge: Bridge
     worker: OutboxWorker
+    group_worker: OutboxWorker | None
     adapters: dict[Platform, BaseAdapter]
     collector: MediaGroupCollector
     media: TempMediaStore | None
@@ -171,6 +172,23 @@ def build_runtime(settings: Settings, repos: Repositories) -> Runtime:
         if settings.healthcheck_file is not None
         else None
     )
+    log = logging.getLogger(LOGGER_NAME)
+    group_link = None
+    if settings.group_sync_enabled:
+        if settings.telegram_group_id is None or settings.bale_group_id is None:
+            log.warning("GROUP_SYNC_ENABLED is true but group ids are missing")
+        else:
+            group_link = repos.group_links.ensure_active(
+                telegram_chat_id=settings.telegram_group_id,
+                bale_chat_id=settings.bale_group_id,
+                now=datetime.now(UTC),
+            )
+            log.info(
+                "group bridge enabled link_id=%s telegram_chat=%s bale_chat=%s",
+                group_link.id,
+                group_link.telegram_chat_id,
+                group_link.bale_chat_id,
+            )
     bridge = Bridge(
         users=users,
         pairing=pairing,
@@ -180,6 +198,9 @@ def build_runtime(settings: Settings, repos: Repositories) -> Runtime:
         tx=repos.db,
         senders=adapters,
         owner_platform_ids=owners,
+        group_links=repos.group_links if group_link is not None else None,
+        group_messages=repos.group_messages if group_link is not None else None,
+        group_outbox=repos.group_outbox if group_link is not None else None,
     )
     worker = OutboxWorker(
         users=users,
@@ -202,6 +223,31 @@ def build_runtime(settings: Settings, repos: Repositories) -> Runtime:
         store=media_store,
         policy=policy,
     )
+    group_worker = (
+        OutboxWorker(
+            users=users,
+            messages=repos.messages,
+            outbox=repos.group_outbox,
+            group_messages=repos.group_messages,
+            tx=repos.db,
+            senders=adapters,
+            retry_policy=retry_policy,
+            rate_limiter=rate_limiter,
+            user_rate_limit_action=settings.user_rate_limit_action,
+            rate_limit_notice_cooldown=timedelta(
+                seconds=settings.user_rate_limit_notice_cooldown_seconds
+            ),
+            stale_sending_after=timedelta(
+                seconds=settings.outbox_stale_sending_seconds
+            ),
+            media_timeout_terminal=settings.outbox_media_timeout_terminal,
+            sent_retention=timedelta(days=settings.outbox_sent_retention_days),
+            store=media_store,
+            policy=policy,
+        )
+        if group_link is not None
+        else None
+    )
     collector = MediaGroupCollector(
         window=settings.media_group_window_seconds,
         flush=bridge.handle_messages,
@@ -214,6 +260,7 @@ def build_runtime(settings: Settings, repos: Repositories) -> Runtime:
         router=router,
         bridge=bridge,
         worker=worker,
+        group_worker=group_worker,
         adapters=adapters,
         collector=collector,
         media=media_store,
@@ -309,10 +356,21 @@ async def run(runtime: Runtime, *, handle_signals: bool = True) -> None:
         )
         for adapter, handler, offsets in runtime.poll_jobs(runtime.collector.add)
     ]
-    worker_task = asyncio.create_task(
-        runtime.worker.run(stop=runtime.stop, interval=runtime.outbox_interval),
-        name="outbox-worker",
-    )
+    worker_tasks = [
+        asyncio.create_task(
+            runtime.worker.run(stop=runtime.stop, interval=runtime.outbox_interval),
+            name="outbox-worker",
+        )
+    ]
+    if runtime.group_worker is not None:
+        worker_tasks.append(
+            asyncio.create_task(
+                runtime.group_worker.run(
+                    stop=runtime.stop, interval=runtime.outbox_interval
+                ),
+                name="group-outbox-worker",
+            )
+        )
     stop_task = asyncio.create_task(runtime.stop.wait(), name="stop-wait")
     try:
         done, _ = await asyncio.wait(
@@ -338,18 +396,20 @@ async def run(runtime: Runtime, *, handle_signals: bool = True) -> None:
             log.error("collector drain failed (%s)", type(exc).__name__)
         try:
             await asyncio.wait_for(
-                worker_task, timeout=runtime.shutdown_timeout
+                asyncio.gather(*worker_tasks), timeout=runtime.shutdown_timeout
             )
         except TimeoutError:
             log.warning(
-                "outbox worker did not stop within %.1fs; cancelling",
+                "outbox workers did not stop within %.1fs; cancelling",
                 runtime.shutdown_timeout,
             )
-            worker_task.cancel()
-            await asyncio.gather(worker_task, return_exceptions=True)
+            for task in worker_tasks:
+                task.cancel()
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
         except asyncio.CancelledError:
-            worker_task.cancel()
-            await asyncio.gather(worker_task, return_exceptions=True)
+            for task in worker_tasks:
+                task.cancel()
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
             raise
         try:
             await runtime.close()

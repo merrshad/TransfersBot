@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     telegram_bot_username: str = "Tele_to_Bale_RoBot"
     bale_bot_username: str = "bale2telrobot"
     pair_invite_ttl_minutes: int = Field(default=15, ge=1)
+
+    # --- group-to-group bridging ---------------------------------------
+    # One configured link: every message in the Telegram group is relayed to
+    # the Bale group and vice versa. Both public and private groups use the
+    # same code path; the bot must be a member/admin in both.
+    group_sync_enabled: bool = False
+    telegram_group_id: int | None = None
+    bale_group_id: int | None = None
     db_path: Path = Path("data/bridge.db")
     log_level: LogLevel = "INFO"
     poll_timeout_seconds: int = Field(default=25, ge=1, le=300)

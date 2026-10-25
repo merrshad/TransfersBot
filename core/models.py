@@ -159,6 +159,10 @@ class UnifiedMessage:
     # message, but it is a command-like event and is never relayed.
     callback_data: str | None = None
     callback_id: str | None = None
+    # Group bridging needs the chat kind and a human sender label.
+    chat_type: str = "private"
+    sender_name: str | None = None
+    is_bot_sender: bool = False
 
     def __post_init__(self) -> None:
         if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
@@ -168,6 +172,11 @@ class UnifiedMessage:
     def key(self) -> tuple[str, int, int]:
         """Natural key matching the ``messages`` unique index."""
         return (self.source.value, self.chat_id, self.message_id)
+
+    @property
+    def is_group(self) -> bool:
+        """Whether this message came from a group/supergroup."""
+        return self.chat_type in {"group", "supergroup"}
 
     @property
     def has_media(self) -> bool:
@@ -262,6 +271,7 @@ class OutboxEntry:
     locked_at: datetime | None = None
     sent_at: datetime | None = None
     last_attempt_at: datetime | None = None
+    group_link_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

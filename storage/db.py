@@ -26,6 +26,7 @@ from types import TracebackType
 from typing import Any, Literal
 
 from core.errors import DuplicateMessageError
+from core.groups import GroupLink, GroupLinkStatus, GroupMessage
 from core.ids import new_pair_token, new_public_id
 from core.models import MessageRecord, OutboxEntry, OutboxStats, OutboxStatus, Platform
 from core.pairing import Pair, PairingInvite, PairingStatus, PairRequest
@@ -270,6 +271,68 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX ix_pairing_invites_expiry ON pairing_invites (expires_at)",
         ),
     ),
+    Migration(
+        version=6,
+        description="group-to-group links, message mapping and group outbox",
+        statements=(
+            """
+            CREATE TABLE group_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_chat_id INTEGER NOT NULL,
+                bale_chat_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CONSTRAINT uq_group_links_telegram UNIQUE (telegram_chat_id),
+                CONSTRAINT uq_group_links_bale UNIQUE (bale_chat_id),
+                CONSTRAINT ck_group_links_status CHECK (
+                    status IN ('active', 'inactive')
+                )
+            )
+            """,
+            """
+            CREATE TABLE group_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_link_id INTEGER NOT NULL
+                    REFERENCES group_links (id) ON DELETE CASCADE,
+                source_platform TEXT NOT NULL,
+                source_chat_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                target_message_id INTEGER,
+                created_at TEXT NOT NULL,
+                CONSTRAINT uq_group_messages_source UNIQUE (
+                    source_platform, source_chat_id, source_message_id
+                ),
+                CONSTRAINT ck_group_messages_platform CHECK (
+                    source_platform IN ('telegram', 'bale')
+                )
+            )
+            """,
+            "CREATE INDEX ix_group_messages_link ON group_messages (group_link_id, id)",
+            """
+            CREATE TABLE group_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_link_id INTEGER NOT NULL
+                    REFERENCES group_links (id) ON DELETE CASCADE,
+                payload TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                last_error TEXT,
+                locked_at TEXT,
+                sent_at TEXT,
+                last_attempt_at TEXT,
+                CONSTRAINT ck_group_outbox_status CHECK (
+                    status IN ('pending', 'sending', 'sent', 'failed')
+                ),
+                CONSTRAINT ck_group_outbox_attempts CHECK (attempts >= 0)
+            )
+            """,
+            "CREATE INDEX ix_group_outbox_link ON group_outbox (group_link_id, status)",
+            "CREATE INDEX ix_group_outbox_due ON group_outbox (status, next_attempt_at)",
+        ),
+    ),
 )
 
 SCHEMA_VERSION_TABLE = "schema_version"
@@ -481,6 +544,30 @@ def _to_pairing_invite(row: sqlite3.Row) -> PairingInvite:
     )
 
 
+def _to_group_link(row: sqlite3.Row) -> GroupLink:
+    return GroupLink(
+        id=int(row["id"]),
+        telegram_chat_id=int(row["telegram_chat_id"]),
+        bale_chat_id=int(row["bale_chat_id"]),
+        status=GroupLinkStatus(row["status"]),
+        created_at=from_db_time(row["created_at"]),
+        updated_at=from_db_time(row["updated_at"]),
+    )
+
+
+def _to_group_message(row: sqlite3.Row) -> GroupMessage:
+    target = row["target_message_id"]
+    return GroupMessage(
+        id=int(row["id"]),
+        group_link_id=int(row["group_link_id"]),
+        source_platform=Platform(row["source_platform"]),
+        source_chat_id=int(row["source_chat_id"]),
+        source_message_id=int(row["source_message_id"]),
+        target_message_id=int(target) if target is not None else None,
+        created_at=from_db_time(row["created_at"]),
+    )
+
+
 def _to_message(row: sqlite3.Row) -> MessageRecord:
     target_message_id = row["target_message_id"]
     return MessageRecord(
@@ -502,6 +589,30 @@ def _to_outbox_entry(row: sqlite3.Row) -> OutboxEntry:
     return OutboxEntry(
         id=int(row["id"]),
         pair_id=int(row["pair_id"]),
+        payload=json.loads(row["payload"]),
+        attempts=int(row["attempts"]),
+        next_attempt_at=from_db_time(row["next_attempt_at"]),
+        status=OutboxStatus(row["status"]),
+        created_at=from_db_time(row["created_at"]),
+        last_error=str(last_error) if last_error is not None else None,
+        locked_at=from_db_time(locked_at) if locked_at is not None else None,
+        sent_at=from_db_time(sent_at) if sent_at is not None else None,
+        last_attempt_at=(
+            from_db_time(last_attempt_at) if last_attempt_at is not None else None
+        ),
+    )
+
+
+def _to_group_outbox_entry(row: sqlite3.Row) -> OutboxEntry:
+    """Map a ``group_outbox`` row into the shared worker value object."""
+    last_error = row["last_error"]
+    locked_at = row["locked_at"]
+    sent_at = row["sent_at"]
+    last_attempt_at = row["last_attempt_at"]
+    return OutboxEntry(
+        id=int(row["id"]),
+        pair_id=0,
+        group_link_id=int(row["group_link_id"]),
         payload=json.loads(row["payload"]),
         attempts=int(row["attempts"]),
         next_attempt_at=from_db_time(row["next_attempt_at"]),
@@ -986,6 +1097,468 @@ class PairingInviteRepository:
         if cursor.rowcount == 0:
             return None
         return self.get(invite_id)
+
+
+class GroupLinkRepository:
+    """SQLite implementation of :class:`core.groups.GroupLinkRepositoryPort`."""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    @property
+    def _connection(self) -> sqlite3.Connection:
+        return self._db.connection
+
+    def ensure_active(
+        self, *, telegram_chat_id: int, bale_chat_id: int, now: datetime
+    ) -> GroupLink:
+        """Create/reactivate the single configured group link.
+
+        The configuration currently models one group pair. Changing either id
+        replaces the old link (and cascades its message/outbox history).
+        """
+        moment = to_db_time(now)
+        with self._db.transaction():
+            row = self._connection.execute(
+                """
+                SELECT * FROM group_links
+                WHERE telegram_chat_id = ? AND bale_chat_id = ?
+                """,
+                (telegram_chat_id, bale_chat_id),
+            ).fetchone()
+            if row is None:
+                self._connection.execute(
+                    "DELETE FROM group_links WHERE NOT (telegram_chat_id = ? AND bale_chat_id = ?)",
+                    (telegram_chat_id, bale_chat_id),
+                )
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO group_links
+                        (telegram_chat_id, bale_chat_id, status, created_at, updated_at)
+                    VALUES (?, ?, 'active', ?, ?)
+                    """,
+                    (telegram_chat_id, bale_chat_id, moment, moment),
+                )
+                row = self._connection.execute(
+                    "SELECT * FROM group_links WHERE id = ?",
+                    (_last_row_id(cursor),),
+                ).fetchone()
+            else:
+                self._connection.execute(
+                    """
+                    UPDATE group_links
+                    SET status = 'active', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (moment, int(row["id"])),
+                )
+            self._connection.execute(
+                """
+                UPDATE group_links
+                SET status = 'inactive', updated_at = ?
+                WHERE status = 'active' AND id <> ?
+                """,
+                (moment, int(row["id"]) if row is not None else 0),
+            )
+            row = self._connection.execute(
+                """
+                SELECT * FROM group_links
+                WHERE telegram_chat_id = ? AND bale_chat_id = ?
+                """,
+                (telegram_chat_id, bale_chat_id),
+            ).fetchone()
+        if row is None:  # pragma: no cover - insert just succeeded
+            raise RuntimeError("group link disappeared after upsert")
+        return _to_group_link(row)
+
+    def get(self, link_id: int) -> GroupLink | None:
+        """Fetch a link by id."""
+        row = self._connection.execute(
+            "SELECT * FROM group_links WHERE id = ?", (link_id,)
+        ).fetchone()
+        return _to_group_link(row) if row is not None else None
+
+    def get_active_for_source(
+        self, platform: Platform, chat_id: int
+    ) -> GroupLink | None:
+        """Return the active link that contains this source group."""
+        column = "telegram_chat_id" if platform is Platform.TELEGRAM else "bale_chat_id"
+        row = self._connection.execute(
+            f"SELECT * FROM group_links WHERE status = 'active' AND {column} = ?",
+            (chat_id,),
+        ).fetchone()
+        return _to_group_link(row) if row is not None else None
+
+
+class GroupMessageRepository:
+    """SQLite implementation of :class:`core.groups.GroupMessageRepositoryPort`."""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    @property
+    def _connection(self) -> sqlite3.Connection:
+        return self._db.connection
+
+    def add(
+        self,
+        *,
+        group_link_id: int,
+        source_platform: Platform,
+        source_chat_id: int,
+        source_message_id: int,
+        created_at: datetime,
+    ) -> tuple[GroupMessage, bool]:
+        """Insert idempotently; returns ``(record, created)``."""
+        try:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO group_messages
+                    (group_link_id, source_platform, source_chat_id,
+                     source_message_id, target_message_id, created_at)
+                VALUES (?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    group_link_id,
+                    source_platform.value,
+                    source_chat_id,
+                    source_message_id,
+                    to_db_time(created_at),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            existing = self.find_by_source(
+                source_platform, source_chat_id, source_message_id
+            )
+            if existing is None:
+                raise
+            return existing, False
+        created = self._connection.execute(
+            "SELECT * FROM group_messages WHERE id = ?", (_last_row_id(cursor),)
+        ).fetchone()
+        if created is None:  # pragma: no cover
+            raise RuntimeError("group message disappeared after insert")
+        return _to_group_message(created), True
+
+    def find_by_source(
+        self,
+        source_platform: Platform,
+        source_chat_id: int,
+        source_message_id: int,
+    ) -> GroupMessage | None:
+        """Look up a message by its global source key (dedup guard)."""
+        row = self._connection.execute(
+            """
+            SELECT * FROM group_messages
+            WHERE source_platform = ? AND source_chat_id = ?
+              AND source_message_id = ?
+            """,
+            (source_platform.value, source_chat_id, source_message_id),
+        ).fetchone()
+        return _to_group_message(row) if row is not None else None
+
+    def find_by_target_in_link(
+        self,
+        group_link_id: int,
+        *,
+        source_platform: Platform,
+        source_chat_id: int,
+        target_message_id: int,
+    ) -> GroupMessage | None:
+        """Find the record a delivered target message id belongs to."""
+        row = self._connection.execute(
+            """
+            SELECT * FROM group_messages
+            WHERE group_link_id = ? AND source_platform = ?
+              AND source_chat_id = ? AND target_message_id = ?
+            """,
+            (
+                group_link_id,
+                source_platform.value,
+                source_chat_id,
+                target_message_id,
+            ),
+        ).fetchone()
+        return _to_group_message(row) if row is not None else None
+
+    def attach_target_message(
+        self, group_message_id: int, target_message_id: int
+    ) -> GroupMessage | None:
+        """Store the platform id the group copy was delivered as."""
+        cursor = self._connection.execute(
+            "UPDATE group_messages SET target_message_id = ? WHERE id = ?",
+            (target_message_id, group_message_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM group_messages WHERE id = ?", (group_message_id,)
+        ).fetchone()
+        return _to_group_message(row) if row is not None else None
+
+
+class GroupOutboxRepository:
+    """Durable delivery queue for group relays (same worker contract)."""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    @property
+    def _connection(self) -> sqlite3.Connection:
+        return self._db.connection
+
+    def enqueue(
+        self,
+        *,
+        pair_id: int | None = None,
+        group_link_id: int | None = None,
+        payload: Mapping[str, Any],
+        next_attempt_at: datetime,
+        created_at: datetime,
+    ) -> OutboxEntry:
+        """Append a pending group delivery.
+
+        ``pair_id`` is accepted only to keep the worker/queue protocol shape;
+        group rows always use ``group_link_id``.
+        """
+        if group_link_id is None:
+            raise ValueError("group_link_id is required for the group outbox")
+        cursor = self._connection.execute(
+            """
+            INSERT INTO group_outbox
+                (group_link_id, payload, attempts, next_attempt_at, status,
+                 created_at, last_error)
+            VALUES (?, ?, 0, ?, 'pending', ?, NULL)
+            """,
+            (
+                group_link_id,
+                json.dumps(dict(payload), ensure_ascii=False, sort_keys=True),
+                to_db_time(next_attempt_at),
+                to_db_time(created_at),
+            ),
+        )
+        created = self.get_for_link(group_link_id, _last_row_id(cursor))
+        if created is None:  # pragma: no cover
+            raise RuntimeError("group outbox row disappeared after insert")
+        return created
+
+    def get_for_link(self, group_link_id: int, entry_id: int) -> OutboxEntry | None:
+        """Fetch one group entry, restricted to its link."""
+        row = self._connection.execute(
+            "SELECT * FROM group_outbox WHERE id = ? AND group_link_id = ?",
+            (entry_id, group_link_id),
+        ).fetchone()
+        return _to_group_outbox_entry(row) if row is not None else None
+
+    def list_for_link(self, group_link_id: int) -> tuple[OutboxEntry, ...]:
+        """List a link's outbound entries oldest-first."""
+        rows = self._connection.execute(
+            "SELECT * FROM group_outbox WHERE group_link_id = ? ORDER BY id",
+            (group_link_id,),
+        ).fetchall()
+        return tuple(_to_group_outbox_entry(row) for row in rows)
+
+    def get_for_pair(self, pair_id: int, entry_id: int) -> OutboxEntry | None:
+        """Protocol compatibility: group rows are not pair-scoped."""
+        return None
+
+    def list_for_pair(
+        self, pair_id: int, *, status: OutboxStatus | None = None
+    ) -> tuple[OutboxEntry, ...]:
+        """Protocol compatibility: group rows are not pair-scoped."""
+        return ()
+
+    def list_due(self, now: datetime, *, limit: int = 100) -> tuple[OutboxEntry, ...]:
+        """Read-only due list (the worker uses :meth:`claim_due`)."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        rows = self._connection.execute(
+            """
+            SELECT * FROM group_outbox
+            WHERE status = 'pending' AND next_attempt_at <= ?
+            ORDER BY next_attempt_at, id
+            LIMIT ?
+            """,
+            (to_db_time(now), limit),
+        ).fetchall()
+        return tuple(_to_group_outbox_entry(row) for row in rows)
+
+    def queue_stats(self, now: datetime | None = None) -> OutboxStats:
+        """Aggregate counters for the group queue (for diagnostics)."""
+        rows = self._connection.execute(
+            "SELECT status, COUNT(*) AS total FROM group_outbox GROUP BY status"
+        ).fetchall()
+        counts = {str(row["status"]): int(row["total"]) for row in rows}
+        return OutboxStats(
+            pending=counts.get(OutboxStatus.PENDING.value, 0),
+            sending=counts.get(OutboxStatus.SENDING.value, 0),
+            sent=counts.get(OutboxStatus.SENT.value, 0),
+            failed=counts.get(OutboxStatus.FAILED.value, 0),
+        )
+
+    def claim_due(self, now: datetime, *, limit: int = 100) -> tuple[OutboxEntry, ...]:
+        """Atomically lease due group entries (pending → sending)."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        moment = to_db_time(now)
+        with self._db.transaction():
+            rows = self._connection.execute(
+                """
+                SELECT id FROM group_outbox
+                WHERE status = 'pending' AND next_attempt_at <= ?
+                ORDER BY next_attempt_at, id
+                LIMIT ?
+                """,
+                (moment, limit),
+            ).fetchall()
+            if not rows:
+                return ()
+            ids = [int(row["id"]) for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+            self._connection.execute(
+                f"""
+                UPDATE group_outbox SET status = 'sending', locked_at = ?
+                WHERE id IN ({placeholders}) AND status = 'pending'
+                """,
+                (moment, *ids),
+            )
+            claimed = self._connection.execute(
+                f"""
+                SELECT * FROM group_outbox
+                WHERE id IN ({placeholders}) AND status = 'sending'
+                ORDER BY next_attempt_at, id
+                """,
+                tuple(ids),
+            ).fetchall()
+        return tuple(_to_group_outbox_entry(row) for row in claimed)
+
+    def recover_orphaned(self, now: datetime | None = None) -> int:
+        """Return every group ``sending`` lease to ``pending`` at startup."""
+        moment = now or utc_now()
+        cursor = self._connection.execute(
+            """
+            UPDATE group_outbox
+            SET status = 'pending', locked_at = NULL, next_attempt_at = ?
+            WHERE status = 'sending'
+            """,
+            (to_db_time(moment),),
+        )
+        return int(cursor.rowcount)
+
+    def recover_stale(self, now: datetime, *, max_age: timedelta) -> int:
+        """Recover a group lease older than ``max_age``."""
+        if max_age < timedelta(0):
+            raise ValueError("max_age must be >= 0")
+        cutoff = to_db_time(now - max_age)
+        cursor = self._connection.execute(
+            """
+            UPDATE group_outbox
+            SET status = 'pending', locked_at = NULL, next_attempt_at = ?
+            WHERE status = 'sending' AND (locked_at IS NULL OR locked_at <= ?)
+            """,
+            (to_db_time(now), cutoff),
+        )
+        return int(cursor.rowcount)
+
+    def mark_sent(
+        self,
+        pair_id: int,  # ignored: group queue has no pair
+        entry_id: int,
+        *,
+        sent_at: datetime | None = None,
+        scrub_payload: bool = True,
+    ) -> OutboxEntry | None:
+        """Mark a group entry sent and scrub its payload."""
+        moment = sent_at or utc_now()
+        payload = "{}" if scrub_payload else None
+        cursor = self._connection.execute(
+            """
+            UPDATE group_outbox
+            SET status = 'sent', payload = COALESCE(?, payload),
+                last_error = NULL, locked_at = NULL,
+                sent_at = ?, last_attempt_at = ?
+            WHERE id = ?
+            """,
+            (payload, to_db_time(moment), to_db_time(moment), entry_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM group_outbox WHERE id = ?", (entry_id,)
+        ).fetchone()
+        return _to_group_outbox_entry(row) if row is not None else None
+
+    def mark_failed(
+        self,
+        pair_id: int,  # ignored
+        entry_id: int,
+        *,
+        error: str,
+        next_attempt_at: datetime,
+        terminal: bool = False,
+        now: datetime | None = None,
+    ) -> OutboxEntry | None:
+        """Record a group failure and schedule/terminalise it."""
+        status = OutboxStatus.FAILED.value if terminal else OutboxStatus.PENDING.value
+        moment = now or utc_now()
+        cursor = self._connection.execute(
+            """
+            UPDATE group_outbox
+            SET attempts = attempts + 1, last_error = ?, next_attempt_at = ?,
+                status = ?, locked_at = NULL, last_attempt_at = ?
+            WHERE id = ?
+            """,
+            (
+                error,
+                to_db_time(next_attempt_at),
+                status,
+                to_db_time(moment),
+                entry_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM group_outbox WHERE id = ?", (entry_id,)
+        ).fetchone()
+        return _to_group_outbox_entry(row) if row is not None else None
+
+    def defer(
+        self,
+        pair_id: int,  # ignored
+        entry_id: int,
+        *,
+        next_attempt_at: datetime,
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> OutboxEntry | None:
+        """Release a group lease without counting an attempt."""
+        cursor = self._connection.execute(
+            """
+            UPDATE group_outbox
+            SET status = 'pending', locked_at = NULL, next_attempt_at = ?,
+                last_error = COALESCE(?, last_error)
+            WHERE id = ?
+            """,
+            (to_db_time(next_attempt_at), reason, entry_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM group_outbox WHERE id = ?", (entry_id,)
+        ).fetchone()
+        return _to_group_outbox_entry(row) if row is not None else None
+
+    def purge_sent(self, before: datetime) -> int:
+        """Delete content-free old group tombstones."""
+        cursor = self._connection.execute(
+            """
+            DELETE FROM group_outbox
+            WHERE status = 'sent' AND sent_at IS NOT NULL AND sent_at < ?
+            """,
+            (to_db_time(before),),
+        )
+        return int(cursor.rowcount)
 
 
 # ------------------------------------------------------------------ messages
@@ -1576,6 +2149,9 @@ class Repositories:
     invites: PairingInviteRepository
     messages: MessageRepository
     outbox: OutboxRepository
+    group_links: GroupLinkRepository
+    group_messages: GroupMessageRepository
+    group_outbox: GroupOutboxRepository
     poll_offsets: PollOffsetRepository
 
     @classmethod
@@ -1590,6 +2166,9 @@ class Repositories:
             invites=PairingInviteRepository(database),
             messages=MessageRepository(database),
             outbox=OutboxRepository(database),
+            group_links=GroupLinkRepository(database),
+            group_messages=GroupMessageRepository(database),
+            group_outbox=GroupOutboxRepository(database),
             poll_offsets=PollOffsetRepository(database),
         )
 
@@ -1607,6 +2186,9 @@ __all__ = [
     "MIGRATIONS",
     "SCHEMA_VERSION_TABLE",
     "Database",
+    "GroupLinkRepository",
+    "GroupMessageRepository",
+    "GroupOutboxRepository",
     "MessageRepository",
     "Migration",
     "OutboxRepository",

@@ -224,13 +224,31 @@ def test_reply_is_captured_as_message_reference() -> None:
     "kwargs",
     [
         {"text": None},  # media-only message
-        {"chat_type": "group"},
         {"chat_type": "channel"},
         {"with_sender": False},  # channel post
     ],
 )
 def test_unhandled_updates_are_skipped(kwargs: dict[str, Any]) -> None:
     assert to_unified_message(message_update(update_id=3, **kwargs)) is None
+
+
+def test_group_message_is_converted_with_sender_label() -> None:
+    message = to_unified_message(
+        message_update(
+            update_id=4,
+            text="سلام گروه",
+            chat_type="supergroup",
+            chat_id=-100123,
+            message_id=77,
+        )
+    )
+
+    assert message is not None
+    assert message.chat_type == "supergroup"
+    assert message.is_group is True
+    assert message.chat_id == -100123
+    assert message.sender_name == "Ali"
+    assert message.is_bot_sender is False
 
 
 def test_callback_without_data_is_skipped() -> None:
@@ -287,7 +305,7 @@ async def test_filtered_updates_still_advance_the_offset() -> None:
         updates=(
             message_update(update_id=5),
             message_update(update_id=6, text=None),  # photo only
-            message_update(update_id=7, chat_type="group"),
+            message_update(update_id=7, chat_type="channel"),
         )
     )
 
