@@ -173,22 +173,29 @@ def build_runtime(settings: Settings, repos: Repositories) -> Runtime:
         else None
     )
     log = logging.getLogger(LOGGER_NAME)
-    group_link = None
-    if settings.group_sync_enabled:
-        if settings.telegram_group_id is None or settings.bale_group_id is None:
-            log.warning("GROUP_SYNC_ENABLED is true but group ids are missing")
-        else:
-            group_link = repos.group_links.ensure_active(
+    group_sync_ready = settings.group_sync_enabled
+    if group_sync_ready:
+        if settings.telegram_group_id is not None and settings.bale_group_id is not None:
+            seeded = repos.group_links.seed_if_empty(
                 telegram_chat_id=settings.telegram_group_id,
                 bale_chat_id=settings.bale_group_id,
                 now=datetime.now(UTC),
             )
+            if seeded is not None:
+                log.info(
+                    "group bootstrap link_id=%s telegram_chat=%s bale_chat=%s",
+                    seeded.id,
+                    seeded.telegram_chat_id,
+                    seeded.bale_chat_id,
+                )
+        else:
             log.info(
-                "group bridge enabled link_id=%s telegram_chat=%s bale_chat=%s",
-                group_link.id,
-                group_link.telegram_chat_id,
-                group_link.bale_chat_id,
+                "group bridge enabled without env bootstrap; use /groupsync in a group"
             )
+        log.info(
+            "group bridge enabled links=%s",
+            len(repos.group_links.list_active()),
+        )
     bridge = Bridge(
         users=users,
         pairing=pairing,
@@ -198,9 +205,11 @@ def build_runtime(settings: Settings, repos: Repositories) -> Runtime:
         tx=repos.db,
         senders=adapters,
         owner_platform_ids=owners,
-        group_links=repos.group_links if group_link is not None else None,
-        group_messages=repos.group_messages if group_link is not None else None,
-        group_outbox=repos.group_outbox if group_link is not None else None,
+        group_links=repos.group_links if group_sync_ready else None,
+        group_messages=repos.group_messages if group_sync_ready else None,
+        group_outbox=repos.group_outbox if group_sync_ready else None,
+        group_invites=repos.group_invites if group_sync_ready else None,
+        group_invite_ttl=timedelta(minutes=settings.group_invite_ttl_minutes),
     )
     worker = OutboxWorker(
         users=users,
@@ -245,7 +254,7 @@ def build_runtime(settings: Settings, repos: Repositories) -> Runtime:
             store=media_store,
             policy=policy,
         )
-        if group_link is not None
+        if group_sync_ready
         else None
     )
     collector = MediaGroupCollector(

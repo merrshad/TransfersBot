@@ -45,12 +45,14 @@ class Settings(BaseSettings):
     pair_invite_ttl_minutes: int = Field(default=15, ge=1)
 
     # --- group-to-group bridging ---------------------------------------
-    # One configured link: every message in the Telegram group is relayed to
-    # the Bale group and vice versa. Both public and private groups use the
-    # same code path; the bot must be a member/admin in both.
+    # Multiple independent Telegram↔Bale links are stored in SQLite and are
+    # created from inside a group by the owner with /groupsync. Both public and
+    # private groups use the same code path; the bot must be a member/admin in
+    # both. The two ids below are an optional first-run bootstrap only.
     group_sync_enabled: bool = False
     telegram_group_id: int | None = None
     bale_group_id: int | None = None
+    group_invite_ttl_minutes: int = Field(default=15, ge=1)
     db_path: Path = Path("data/bridge.db")
     log_level: LogLevel = "INFO"
     poll_timeout_seconds: int = Field(default=25, ge=1, le=300)

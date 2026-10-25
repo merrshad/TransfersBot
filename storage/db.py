@@ -26,7 +26,13 @@ from types import TracebackType
 from typing import Any, Literal
 
 from core.errors import DuplicateMessageError
-from core.groups import GroupLink, GroupLinkStatus, GroupMessage
+from core.groups import (
+    GroupAlreadyLinkedError,
+    GroupLink,
+    GroupLinkInvite,
+    GroupLinkStatus,
+    GroupMessage,
+)
 from core.ids import new_pair_token, new_public_id
 from core.models import MessageRecord, OutboxEntry, OutboxStats, OutboxStatus, Platform
 from core.pairing import Pair, PairingInvite, PairingStatus, PairRequest
@@ -333,6 +339,31 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX ix_group_outbox_due ON group_outbox (status, next_attempt_at)",
         ),
     ),
+    Migration(
+        version=7,
+        description="single-use group pairing invites",
+        statements=(
+            """
+            CREATE TABLE group_link_invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL,
+                source_platform TEXT NOT NULL,
+                source_chat_id INTEGER NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
+                used_chat_id INTEGER,
+                CONSTRAINT uq_group_link_invites_token UNIQUE (token),
+                CONSTRAINT ck_group_link_invites_platform CHECK (
+                    source_platform IN ('telegram', 'bale')
+                )
+            )
+            """,
+            "CREATE INDEX ix_group_link_invites_source ON group_link_invites (source_platform, source_chat_id, used_at)",
+            "CREATE INDEX ix_group_link_invites_expiry ON group_link_invites (expires_at)",
+        ),
+    ),
 )
 
 SCHEMA_VERSION_TABLE = "schema_version"
@@ -552,6 +583,22 @@ def _to_group_link(row: sqlite3.Row) -> GroupLink:
         status=GroupLinkStatus(row["status"]),
         created_at=from_db_time(row["created_at"]),
         updated_at=from_db_time(row["updated_at"]),
+    )
+
+
+def _to_group_link_invite(row: sqlite3.Row) -> GroupLinkInvite:
+    used_at = row["used_at"]
+    used_chat_id = row["used_chat_id"]
+    return GroupLinkInvite(
+        id=int(row["id"]),
+        token=str(row["token"]),
+        source_platform=Platform(row["source_platform"]),
+        source_chat_id=int(row["source_chat_id"]),
+        created_by=int(row["created_by"]),
+        created_at=from_db_time(row["created_at"]),
+        expires_at=from_db_time(row["expires_at"]),
+        used_at=from_db_time(used_at) if used_at is not None else None,
+        used_chat_id=int(used_chat_id) if used_chat_id is not None else None,
     )
 
 
@@ -1109,67 +1156,67 @@ class GroupLinkRepository:
     def _connection(self) -> sqlite3.Connection:
         return self._db.connection
 
-    def ensure_active(
+    def link(
         self, *, telegram_chat_id: int, bale_chat_id: int, now: datetime
     ) -> GroupLink:
-        """Create/reactivate the single configured group link.
+        """Create one active link without touching other independent links.
 
-        The configuration currently models one group pair. Changing either id
-        replaces the old link (and cascades its message/outbox history).
+        Raises:
+            GroupAlreadyLinkedError: If either group already belongs to an
+                active link.
         """
         moment = to_db_time(now)
         with self._db.transaction():
-            row = self._connection.execute(
+            active = self._connection.execute(
                 """
                 SELECT * FROM group_links
-                WHERE telegram_chat_id = ? AND bale_chat_id = ?
+                WHERE status = 'active'
+                  AND (telegram_chat_id IN (?, ?) OR bale_chat_id IN (?, ?))
+                LIMIT 1
                 """,
-                (telegram_chat_id, bale_chat_id),
+                (telegram_chat_id, bale_chat_id, telegram_chat_id, bale_chat_id),
             ).fetchone()
-            if row is None:
-                self._connection.execute(
-                    "DELETE FROM group_links WHERE NOT (telegram_chat_id = ? AND bale_chat_id = ?)",
-                    (telegram_chat_id, bale_chat_id),
-                )
-                cursor = self._connection.execute(
-                    """
-                    INSERT INTO group_links
-                        (telegram_chat_id, bale_chat_id, status, created_at, updated_at)
-                    VALUES (?, ?, 'active', ?, ?)
-                    """,
-                    (telegram_chat_id, bale_chat_id, moment, moment),
-                )
-                row = self._connection.execute(
-                    "SELECT * FROM group_links WHERE id = ?",
-                    (_last_row_id(cursor),),
-                ).fetchone()
-            else:
-                self._connection.execute(
-                    """
-                    UPDATE group_links
-                    SET status = 'active', updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (moment, int(row["id"])),
-                )
+            if active is not None:
+                raise GroupAlreadyLinkedError()
+            # Re-linking a previously disconnected group is allowed. Delete
+            # only inactive rows that still occupy its unique chat ids.
             self._connection.execute(
                 """
-                UPDATE group_links
-                SET status = 'inactive', updated_at = ?
-                WHERE status = 'active' AND id <> ?
+                DELETE FROM group_links
+                WHERE telegram_chat_id IN (?, ?) OR bale_chat_id IN (?, ?)
                 """,
-                (moment, int(row["id"]) if row is not None else 0),
+                (telegram_chat_id, bale_chat_id, telegram_chat_id, bale_chat_id),
+            )
+            cursor = self._connection.execute(
+                """
+                INSERT INTO group_links
+                    (telegram_chat_id, bale_chat_id, status, created_at, updated_at)
+                VALUES (?, ?, 'active', ?, ?)
+                """,
+                (telegram_chat_id, bale_chat_id, moment, moment),
             )
             row = self._connection.execute(
-                """
-                SELECT * FROM group_links
-                WHERE telegram_chat_id = ? AND bale_chat_id = ?
-                """,
-                (telegram_chat_id, bale_chat_id),
+                "SELECT * FROM group_links WHERE id = ?",
+                (_last_row_id(cursor),),
             ).fetchone()
         if row is None:  # pragma: no cover - insert just succeeded
-            raise RuntimeError("group link disappeared after upsert")
+            raise RuntimeError("group link disappeared after insert")
         return _to_group_link(row)
+
+    def seed_if_empty(
+        self, *, telegram_chat_id: int, bale_chat_id: int, now: datetime
+    ) -> GroupLink | None:
+        """Create the legacy env link only when the database has no links."""
+        row = self._connection.execute(
+            "SELECT 1 FROM group_links LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            return None
+        return self.link(
+            telegram_chat_id=telegram_chat_id,
+            bale_chat_id=bale_chat_id,
+            now=now,
+        )
 
     def get(self, link_id: int) -> GroupLink | None:
         """Fetch a link by id."""
@@ -1188,6 +1235,135 @@ class GroupLinkRepository:
             (chat_id,),
         ).fetchone()
         return _to_group_link(row) if row is not None else None
+
+    def deactivate(self, link_id: int, *, now: datetime) -> GroupLink | None:
+        """Move one link to inactive without touching other links."""
+        moment = to_db_time(now)
+        cursor = self._connection.execute(
+            """
+            UPDATE group_links
+            SET status = 'inactive', updated_at = ?
+            WHERE id = ? AND status = 'active'
+            """,
+            (moment, link_id),
+        )
+        if cursor.rowcount == 0:
+            return self.get(link_id)
+        return self.get(link_id)
+
+    def list_active(self) -> tuple[GroupLink, ...]:
+        """Return every active link, oldest first."""
+        rows = self._connection.execute(
+            "SELECT * FROM group_links WHERE status = 'active' ORDER BY id"
+        ).fetchall()
+        return tuple(_to_group_link(row) for row in rows)
+
+
+class GroupLinkInviteRepository:
+    """SQLite implementation of single-use group pairing codes."""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    @property
+    def _connection(self) -> sqlite3.Connection:
+        return self._db.connection
+
+    def create(
+        self,
+        *,
+        token: str,
+        source_platform: Platform,
+        source_chat_id: int,
+        created_by: int,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> GroupLinkInvite:
+        """Store a new pending code."""
+        cursor = self._connection.execute(
+            """
+            INSERT INTO group_link_invites
+                (token, source_platform, source_chat_id, created_by,
+                 created_at, expires_at, used_at, used_chat_id)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+            """,
+            (
+                token,
+                source_platform.value,
+                source_chat_id,
+                created_by,
+                to_db_time(created_at),
+                to_db_time(expires_at),
+            ),
+        )
+        row = self._connection.execute(
+            "SELECT * FROM group_link_invites WHERE id = ?",
+            (_last_row_id(cursor),),
+        ).fetchone()
+        if row is None:  # pragma: no cover
+            raise RuntimeError("group invite disappeared after insert")
+        return _to_group_link_invite(row)
+
+    def get_pending(
+        self, token: str, *, now: datetime
+    ) -> GroupLinkInvite | None:
+        """Return an unused, unexpired code by its token."""
+        row = self._connection.execute(
+            """
+            SELECT * FROM group_link_invites
+            WHERE token = ? AND used_at IS NULL AND expires_at > ?
+            """,
+            (token, to_db_time(now)),
+        ).fetchone()
+        return _to_group_link_invite(row) if row is not None else None
+
+    def find_pending_for_source(
+        self, platform: Platform, chat_id: int, *, now: datetime
+    ) -> GroupLinkInvite | None:
+        """Return the newest pending code for a source group."""
+        row = self._connection.execute(
+            """
+            SELECT * FROM group_link_invites
+            WHERE source_platform = ? AND source_chat_id = ?
+              AND used_at IS NULL AND expires_at > ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (platform.value, chat_id, to_db_time(now)),
+        ).fetchone()
+        return _to_group_link_invite(row) if row is not None else None
+
+    def mark_used(
+        self, token: str, *, used_at: datetime, used_chat_id: int
+    ) -> GroupLinkInvite | None:
+        """Consume a code; ``None`` if it was already used or vanished."""
+        cursor = self._connection.execute(
+            """
+            UPDATE group_link_invites
+            SET used_at = ?, used_chat_id = ?
+            WHERE token = ? AND used_at IS NULL
+            """,
+            (to_db_time(used_at), used_chat_id, token),
+        )
+        if cursor.rowcount == 0:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM group_link_invites WHERE token = ?", (token,)
+        ).fetchone()
+        return _to_group_link_invite(row) if row is not None else None
+
+    def revoke_pending_for_source(
+        self, platform: Platform, chat_id: int
+    ) -> int:
+        """Delete pending codes for a source group before re-issuing."""
+        cursor = self._connection.execute(
+            """
+            DELETE FROM group_link_invites
+            WHERE source_platform = ? AND source_chat_id = ? AND used_at IS NULL
+            """,
+            (platform.value, chat_id),
+        )
+        return int(cursor.rowcount)
 
 
 class GroupMessageRepository:
@@ -1557,6 +1733,17 @@ class GroupOutboxRepository:
             WHERE status = 'sent' AND sent_at IS NOT NULL AND sent_at < ?
             """,
             (to_db_time(before),),
+        )
+        return int(cursor.rowcount)
+
+    def cancel_pending(self, group_link_id: int) -> int:
+        """Delete every unsent group delivery for one disconnected link."""
+        cursor = self._connection.execute(
+            """
+            DELETE FROM group_outbox
+            WHERE group_link_id = ? AND status IN ('pending', 'sending')
+            """,
+            (group_link_id,),
         )
         return int(cursor.rowcount)
 
@@ -2150,6 +2337,7 @@ class Repositories:
     messages: MessageRepository
     outbox: OutboxRepository
     group_links: GroupLinkRepository
+    group_invites: GroupLinkInviteRepository
     group_messages: GroupMessageRepository
     group_outbox: GroupOutboxRepository
     poll_offsets: PollOffsetRepository
@@ -2167,6 +2355,7 @@ class Repositories:
             messages=MessageRepository(database),
             outbox=OutboxRepository(database),
             group_links=GroupLinkRepository(database),
+            group_invites=GroupLinkInviteRepository(database),
             group_messages=GroupMessageRepository(database),
             group_outbox=GroupOutboxRepository(database),
             poll_offsets=PollOffsetRepository(database),
@@ -2186,6 +2375,7 @@ __all__ = [
     "MIGRATIONS",
     "SCHEMA_VERSION_TABLE",
     "Database",
+    "GroupLinkInviteRepository",
     "GroupLinkRepository",
     "GroupMessageRepository",
     "GroupOutboxRepository",

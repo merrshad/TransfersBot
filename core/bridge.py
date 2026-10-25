@@ -29,10 +29,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from core.commands import (
     Action,
+    Command,
     CommandRouter,
     EditMessageAction,
     SendMessageAction,
@@ -46,10 +47,16 @@ from core.delivery import (
 from core.errors import DomainError, DuplicateMessageError, MessagingError, UserBannedError
 from core.formatting import render_relay_text
 from core.groups import (
+    GroupAlreadyLinkedError,
+    GroupInviteInvalidError,
+    GroupLinkInviteRepositoryPort,
+    GroupLinkNotFoundError,
     GroupLinkRepositoryPort,
     GroupMessageRepositoryPort,
     GroupOutboxRepositoryPort,
+    GroupOwnerOnlyError,
 )
+from core.ids import new_group_token
 from core.media import RELAY_MEDIA_KIND, media_item_payload, unsupported_placeholder
 from core.models import MessageRef, Platform, SentMessage, UnifiedMessage
 from core.pairing import Pair, PairingService
@@ -102,6 +109,8 @@ class Bridge:
         group_links: GroupLinkRepositoryPort | None = None,
         group_messages: GroupMessageRepositoryPort | None = None,
         group_outbox: GroupOutboxRepositoryPort | None = None,
+        group_invites: GroupLinkInviteRepositoryPort | None = None,
+        group_invite_ttl: timedelta = timedelta(minutes=15),
         clock: Callable[[], datetime] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -116,6 +125,8 @@ class Bridge:
         self._group_links = group_links
         self._group_messages = group_messages
         self._group_outbox = group_outbox
+        self._group_invites = group_invites
+        self._group_invite_ttl = group_invite_ttl
         self._clock = clock or (lambda: datetime.now(UTC))
         self._log = logger or logging.getLogger("bridge.core")
 
@@ -192,12 +203,38 @@ class Bridge:
             self._group_links is None
             or self._group_messages is None
             or self._group_outbox is None
+            or self._group_invites is None
         ):
             return
 
         leader = messages[0]
         if leader.is_bot_sender:
             return
+        if (
+            not leader.media
+            and leader.text
+            and leader.text.lstrip().startswith("/")
+        ):
+            command = parse_command(leader.text)
+            if command is not None and command.name == "groupsync":
+                try:
+                    await self._handle_groupsync_command(leader, command)
+                except DomainError as exc:
+                    await self._send_group_notice(leader, exc.message)
+                except Exception as exc:  # noqa: BLE001 - never poison polling
+                    self._log.error(
+                        "group command failed platform=%s chat_id=%s (%s)",
+                        leader.source.value,
+                        leader.chat_id,
+                        type(exc).__name__,
+                    )
+                    await self._send_group_notice(
+                        leader,
+                        "انجام دستور ناموفق بود. دوباره تلاش کنید.",
+                    )
+            # Group commands are setup/administration, never relayed.
+            return
+
         link = self._group_links.get_active_for_source(
             leader.source, leader.chat_id
         )
@@ -210,13 +247,6 @@ class Bridge:
             if not message.is_bot_sender and message.is_relayable
         )
         if not batch:
-            return
-        if (
-            not leader.media
-            and leader.text
-            and leader.text.lstrip().startswith("/")
-        ):
-            # Group commands are setup/administration, never relayed.
             return
 
         fresh = tuple(
@@ -287,6 +317,248 @@ class Bridge:
                 queued,
                 album_id is not None,
             )
+
+    @staticmethod
+    def _group_platform_name(platform: Platform) -> str:
+        return "تلگرام" if platform is Platform.TELEGRAM else "بله"
+
+    @staticmethod
+    def _groupsync_help_text() -> str:
+        return (
+            "🔗 مدیریت سینک گروه‌ها (فقط مالک)\n\n"
+            "/groupsync\n"
+            "ساخت کد اتصال برای همین گروه؛ کد را در گروه پلتفرم مقابل بفرستید.\n\n"
+            "/groupsync <کد>\n"
+            "تکمیل اتصال با کد گروه اول.\n\n"
+            "/groupsync off\n"
+            "قطع سینک این گروه.\n\n"
+            "/groupsync list\n"
+            "نمایش همهٔ جفت‌گروه‌های فعال."
+        )
+
+    async def _send_group_notice(
+        self, message: UnifiedMessage, text: str
+    ) -> None:
+        """Reply in the same group without going through the outbox."""
+        sender = self._senders.get(message.source)
+        if sender is None:
+            self._log.warning(
+                "group command reply skipped platform=%s (no sender)",
+                message.source.value,
+            )
+            return
+        try:
+            await sender.send_message(message.chat_id, text)
+        except MessagingError as exc:
+            self._log.warning(
+                "group command reply failed platform=%s chat_id=%s (%s)",
+                message.source.value,
+                message.chat_id,
+                type(exc).__name__,
+            )
+
+    async def _handle_groupsync_command(
+        self, message: UnifiedMessage, command: Command
+    ) -> None:
+        """Owner-only group link management from inside a group."""
+        owner_id = self._owner_platform_ids.get(message.source)
+        if owner_id != message.sender_id:
+            await self._send_group_notice(message, GroupOwnerOnlyError().message)
+            return
+
+        args = command.args
+        if not args:
+            await self._issue_group_invite(message)
+            return
+        if len(args) > 1:
+            await self._send_group_notice(message, self._groupsync_help_text())
+            return
+
+        arg = str(args[0]).strip()
+        lowered = arg.lower()
+        if lowered in {"off", "stop", "unlink"}:
+            await self._disconnect_group(message)
+        elif lowered in {"list", "ls"}:
+            await self._list_group_links(message)
+        elif lowered in {"help", "?", "h"}:
+            await self._send_group_notice(message, self._groupsync_help_text())
+        else:
+            await self._complete_group_invite(message, arg.upper())
+
+    async def _issue_group_invite(self, message: UnifiedMessage) -> None:
+        """Create a single-use code for this group."""
+        if self._group_links is None or self._group_invites is None:
+            return
+        existing = self._group_links.get_active_for_source(
+            message.source, message.chat_id
+        )
+        if existing is not None:
+            await self._send_group_notice(
+                message, GroupAlreadyLinkedError().message
+            )
+            return
+        target = (
+            Platform.BALE
+            if message.source is Platform.TELEGRAM
+            else Platform.TELEGRAM
+        )
+        now = self._clock()
+        self._group_invites.revoke_pending_for_source(
+            message.source, message.chat_id
+        )
+        token = new_group_token()
+        try:
+            invite = self._group_invites.create(
+                token=token,
+                source_platform=message.source,
+                source_chat_id=message.chat_id,
+                created_by=message.sender_id,
+                created_at=now,
+                expires_at=now + self._group_invite_ttl,
+            )
+        except Exception as exc:  # noqa: BLE001 - command must not kill polling
+            self._log.error(
+                "group invite create failed platform=%s chat_id=%s (%s)",
+                message.source.value,
+                message.chat_id,
+                type(exc).__name__,
+            )
+            await self._send_group_notice(
+                message, "ساخت کد اتصال ناموفق بود. دوباره تلاش کنید."
+            )
+            return
+
+        minutes = max(1, int(self._group_invite_ttl.total_seconds() // 60))
+        text = (
+            "🔗 کد اتصال این گروه:\n"
+            f"{invite.token}\n\n"
+            f"این کد را در گروه {self._group_platform_name(target)} بفرستید:\n"
+            f"/groupsync {invite.token}\n\n"
+            f"اعتبار: {minutes} دقیقه"
+        )
+        await self._send_group_notice(message, text)
+        self._log.info(
+            "group invite created platform=%s chat_id=%s target=%s",
+            message.source.value,
+            message.chat_id,
+            target.value,
+        )
+
+    async def _complete_group_invite(
+        self, message: UnifiedMessage, token: str
+    ) -> None:
+        """Consume a code and create the link between the two groups."""
+        if (
+            self._group_links is None
+            or self._group_invites is None
+            or self._group_outbox is None
+        ):
+            return
+        now = self._clock()
+        invite = self._group_invites.get_pending(token, now=now)
+        if invite is None:
+            await self._send_group_notice(
+                message, GroupInviteInvalidError().message
+            )
+            return
+        if invite.source_platform is message.source:
+            expected = (
+                "بله"
+                if invite.source_platform is Platform.TELEGRAM
+                else "تلگرام"
+            )
+            await self._send_group_notice(
+                message, f"این کد باید در گروه {expected} استفاده شود."
+            )
+            return
+        if self._group_links.get_active_for_source(
+            message.source, message.chat_id
+        ) is not None or self._group_links.get_active_for_source(
+            invite.source_platform, invite.source_chat_id
+        ) is not None:
+            await self._send_group_notice(
+                message, GroupAlreadyLinkedError().message
+            )
+            return
+
+        used = self._group_invites.mark_used(
+            token, used_at=now, used_chat_id=message.chat_id
+        )
+        if used is None:
+            await self._send_group_notice(
+                message, GroupInviteInvalidError().message
+            )
+            return
+
+        if invite.source_platform is Platform.TELEGRAM:
+            telegram_chat_id = invite.source_chat_id
+            bale_chat_id = message.chat_id
+        else:
+            telegram_chat_id = message.chat_id
+            bale_chat_id = invite.source_chat_id
+        try:
+            link = self._group_links.link(
+                telegram_chat_id=telegram_chat_id,
+                bale_chat_id=bale_chat_id,
+                now=now,
+            )
+        except GroupAlreadyLinkedError:
+            await self._send_group_notice(
+                message, GroupAlreadyLinkedError().message
+            )
+            return
+        await self._send_group_notice(
+            message,
+            "✅ سینک گروه‌ها فعال شد.\n"
+            f"تلگرام: {link.telegram_chat_id}\n"
+            f"بله: {link.bale_chat_id}",
+        )
+        self._log.info(
+            "group link created link_id=%s telegram_chat=%s bale_chat=%s",
+            link.id,
+            link.telegram_chat_id,
+            link.bale_chat_id,
+        )
+
+    async def _disconnect_group(self, message: UnifiedMessage) -> None:
+        """Disconnect this group and drop its unsent deliveries."""
+        if self._group_links is None or self._group_outbox is None:
+            return
+        link = self._group_links.get_active_for_source(
+            message.source, message.chat_id
+        )
+        if link is None:
+            await self._send_group_notice(
+                message, GroupLinkNotFoundError().message
+            )
+            return
+        self._group_links.deactivate(link.id, now=self._clock())
+        removed = self._group_outbox.cancel_pending(link.id)
+        await self._send_group_notice(message, "✅ سینک این گروه قطع شد.")
+        self._log.info(
+            "group link disconnected link_id=%s chat_id=%s cancelled=%s",
+            link.id,
+            message.chat_id,
+            removed,
+        )
+
+    async def _list_group_links(self, message: UnifiedMessage) -> None:
+        """Show every active link to the owner."""
+        if self._group_links is None:
+            return
+        links = self._group_links.list_active()
+        if not links:
+            await self._send_group_notice(
+                message, "هیچ جفت‌گروه فعالی وجود ندارد."
+            )
+            return
+        lines = ["🔗 جفت‌گروه‌های فعال:"]
+        for index, link in enumerate(links, start=1):
+            lines.append(
+                f"{index}) تلگرام {link.telegram_chat_id} ↔ "
+                f"بله {link.bale_chat_id}"
+            )
+        await self._send_group_notice(message, "\n".join(lines))
 
     def _group_album_id(
         self, messages: Sequence[UnifiedMessage]

@@ -19,12 +19,14 @@ from tests.conftest import FIXED_NOW, RecordingSender
 
 TG_GROUP = -1001234567890
 BALE_GROUP = 4497595490
+TG_GROUP_2 = -1009876543210
+BALE_GROUP_2 = 4497595491
 
 
 @pytest.fixture
 def link(repos: Repositories):
     """The configured Telegram ↔ Bale group link."""
-    return repos.group_links.ensure_active(
+    return repos.group_links.link(
         telegram_chat_id=TG_GROUP,
         bale_chat_id=BALE_GROUP,
         now=FIXED_NOW,
@@ -53,6 +55,8 @@ def group_bridge(
         group_links=repos.group_links,
         group_messages=repos.group_messages,
         group_outbox=repos.group_outbox,
+        group_invites=repos.group_invites,
+        group_invite_ttl=timedelta(minutes=15),
         clock=lambda: FIXED_NOW,
     )
 
@@ -112,18 +116,26 @@ def group_message(
     )
 
 
-def test_group_link_ensure_is_idempotent(repos: Repositories) -> None:
-    first = repos.group_links.ensure_active(
+def test_multiple_group_links_are_independent(repos: Repositories) -> None:
+    first = repos.group_links.link(
         telegram_chat_id=TG_GROUP, bale_chat_id=BALE_GROUP, now=FIXED_NOW
     )
-    second = repos.group_links.ensure_active(
-        telegram_chat_id=TG_GROUP, bale_chat_id=BALE_GROUP, now=FIXED_NOW
+    second = repos.group_links.link(
+        telegram_chat_id=TG_GROUP_2, bale_chat_id=BALE_GROUP_2, now=FIXED_NOW
     )
 
-    assert first.id == second.id
     assert first.status is GroupLinkStatus.ACTIVE
+    assert second.status is GroupLinkStatus.ACTIVE
+    assert first.id != second.id
     assert repos.group_links.get_active_for_source(Platform.TELEGRAM, TG_GROUP) == first
-    assert repos.group_links.get_active_for_source(Platform.BALE, BALE_GROUP) == first
+    assert repos.group_links.get_active_for_source(Platform.BALE, BALE_GROUP_2) == second
+    assert repos.group_links.list_active() == (first, second)
+    assert (
+        repos.group_links.seed_if_empty(
+            telegram_chat_id=TG_GROUP, bale_chat_id=BALE_GROUP, now=FIXED_NOW
+        )
+        is None
+    )
 
 
 async def test_group_text_is_queued_with_sender_prefix(
@@ -236,3 +248,235 @@ async def test_group_media_is_queued_and_delivered(
     assert len(senders[Platform.BALE].media) == 1
     assert senders[Platform.BALE].media[0].chat_id == BALE_GROUP
     assert senders[Platform.BALE].media[0].items[0].caption.startswith("👤 Ali:")
+
+async def test_owner_creates_a_group_invite(group_bridge: Bridge, repos: Repositories, senders) -> None:
+    await group_bridge.handle_message(
+        group_message(text="/groupsync", sender_id=9001)
+    )
+
+    invite = repos.group_invites.find_pending_for_source(
+        Platform.TELEGRAM, TG_GROUP, now=FIXED_NOW
+    )
+    assert invite is not None
+    assert invite.token
+    replies = senders[Platform.TELEGRAM].texts_to(TG_GROUP)
+    assert replies
+    assert invite.token in replies[-1]
+
+
+async def test_non_owner_cannot_create_a_group_invite(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    await group_bridge.handle_message(
+        group_message(text="/groupsync", sender_id=7001)
+    )
+
+    assert (
+        repos.group_invites.find_pending_for_source(
+            Platform.TELEGRAM, TG_GROUP, now=FIXED_NOW
+        )
+        is None
+    )
+    assert any("مالک" in text for text in senders[Platform.TELEGRAM].texts_to(TG_GROUP))
+
+
+async def test_owner_completes_link_in_the_opposite_group(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    await group_bridge.handle_message(
+        group_message(text="/groupsync", sender_id=9001)
+    )
+    invite = repos.group_invites.find_pending_for_source(
+        Platform.TELEGRAM, TG_GROUP, now=FIXED_NOW
+    )
+    assert invite is not None
+
+    await group_bridge.handle_message(
+        group_message(
+            platform=Platform.BALE,
+            chat_id=BALE_GROUP_2,
+            message_id=101,
+            text=f"/groupsync {invite.token}",
+            sender_id=9002,
+            sender_name="مالک",
+        )
+    )
+
+    linked = repos.group_links.get_active_for_source(Platform.BALE, BALE_GROUP_2)
+    assert linked is not None
+    assert linked.telegram_chat_id == TG_GROUP
+    assert linked.bale_chat_id == BALE_GROUP_2
+    assert (
+        repos.group_invites.find_pending_for_source(
+            Platform.TELEGRAM, TG_GROUP, now=FIXED_NOW
+        )
+        is None
+    )
+    assert any("فعال" in text for text in senders[Platform.BALE].texts_to(BALE_GROUP_2))
+
+
+async def test_group_invite_cannot_be_used_twice(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    await group_bridge.handle_message(
+        group_message(text="/groupsync", sender_id=9001)
+    )
+    invite = repos.group_invites.find_pending_for_source(
+        Platform.TELEGRAM, TG_GROUP, now=FIXED_NOW
+    )
+    assert invite is not None
+    await group_bridge.handle_message(
+        group_message(
+            platform=Platform.BALE,
+            chat_id=BALE_GROUP_2,
+            message_id=102,
+            text=f"/groupsync {invite.token}",
+            sender_id=9002,
+        )
+    )
+    await group_bridge.handle_message(
+        group_message(
+            platform=Platform.BALE,
+            chat_id=4497595492,
+            message_id=103,
+            text=f"/groupsync {invite.token}",
+            sender_id=9002,
+        )
+    )
+
+    assert (
+        repos.group_links.get_active_for_source(Platform.BALE, 4497595492) is None
+    )
+    assert any(
+        "نامعتبر" in text for text in senders[Platform.BALE].texts_to(4497595492)
+    )
+
+
+async def test_groupsync_off_deactivates_and_cancels_pending(
+    group_bridge: Bridge, repos: Repositories, senders, link
+) -> None:
+    await group_bridge.handle_message(
+        group_message(message_id=110, text="پیام در صف")
+    )
+    assert repos.group_outbox.list_for_link(link.id)
+
+    await group_bridge.handle_message(
+        group_message(
+            message_id=111, text="/groupsync off", sender_id=9001
+        )
+    )
+
+    assert repos.group_links.get_active_for_source(Platform.TELEGRAM, TG_GROUP) is None
+    assert repos.group_links.get(link.id).status is GroupLinkStatus.INACTIVE
+    assert repos.group_outbox.list_for_link(link.id) == ()
+    assert any("قطع" in text for text in senders[Platform.TELEGRAM].texts_to(TG_GROUP))
+
+
+async def test_groupsync_list_shows_all_active_links(
+    group_bridge: Bridge, repos: Repositories, senders, link
+) -> None:
+    repos.group_links.link(
+        telegram_chat_id=TG_GROUP_2,
+        bale_chat_id=BALE_GROUP_2,
+        now=FIXED_NOW,
+    )
+
+    await group_bridge.handle_message(
+        group_message(message_id=120, text="/groupsync list", sender_id=9001)
+    )
+
+    reply = senders[Platform.TELEGRAM].texts_to(TG_GROUP)[-1]
+    assert str(TG_GROUP) in reply
+    assert str(BALE_GROUP) in reply
+    assert str(TG_GROUP_2) in reply
+    assert str(BALE_GROUP_2) in reply
+    assert repos.group_outbox.list_for_link(link.id) == ()
+
+
+async def test_each_pair_routes_to_its_own_target(group_bridge: Bridge, repos: Repositories, link) -> None:
+    second = repos.group_links.link(
+        telegram_chat_id=TG_GROUP_2,
+        bale_chat_id=BALE_GROUP_2,
+        now=FIXED_NOW,
+    )
+    await group_bridge.handle_message(
+        group_message(chat_id=TG_GROUP_2, message_id=130, text="دومی")
+    )
+
+    first_entries = repos.group_outbox.list_for_link(link.id)
+    second_entries = repos.group_outbox.list_for_link(second.id)
+    assert first_entries == ()
+    assert len(second_entries) == 1
+    assert second_entries[0].payload["target_chat_id"] == BALE_GROUP_2
+
+async def test_bale_owner_can_start_a_link(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    await group_bridge.handle_message(
+        group_message(
+            platform=Platform.BALE,
+            chat_id=BALE_GROUP_2,
+            message_id=140,
+            text="/groupsync",
+            sender_id=9002,
+        )
+    )
+    invite = repos.group_invites.find_pending_for_source(
+        Platform.BALE, BALE_GROUP_2, now=FIXED_NOW
+    )
+    assert invite is not None
+
+    await group_bridge.handle_message(
+        group_message(
+            chat_id=TG_GROUP_2,
+            message_id=141,
+            text=f"/groupsync {invite.token}",
+            sender_id=9001,
+        )
+    )
+
+    linked = repos.group_links.get_active_for_source(Platform.TELEGRAM, TG_GROUP_2)
+    assert linked is not None
+    assert linked.telegram_chat_id == TG_GROUP_2
+    assert linked.bale_chat_id == BALE_GROUP_2
+    assert any("فعال" in text for text in senders[Platform.TELEGRAM].texts_to(TG_GROUP_2))
+
+
+async def test_group_invite_must_be_used_on_the_opposite_platform(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    await group_bridge.handle_message(
+        group_message(text="/groupsync", sender_id=9001)
+    )
+    invite = repos.group_invites.find_pending_for_source(
+        Platform.TELEGRAM, TG_GROUP, now=FIXED_NOW
+    )
+    assert invite is not None
+
+    await group_bridge.handle_message(
+        group_message(
+            chat_id=TG_GROUP_2,
+            message_id=150,
+            text=f"/groupsync {invite.token}",
+            sender_id=9001,
+        )
+    )
+
+    assert repos.group_links.get_active_for_source(Platform.TELEGRAM, TG_GROUP_2) is None
+    assert any("بله" in text for text in senders[Platform.TELEGRAM].texts_to(TG_GROUP_2))
+
+
+async def test_groupsync_in_a_linked_group_reports_existing_link(
+    group_bridge: Bridge, repos: Repositories, senders, link
+) -> None:
+    await group_bridge.handle_message(
+        group_message(message_id=160, text="/groupsync", sender_id=9001)
+    )
+
+    assert (
+        repos.group_invites.find_pending_for_source(
+            Platform.TELEGRAM, TG_GROUP, now=FIXED_NOW
+        )
+        is None
+    )
+    assert any("وصل" in text for text in senders[Platform.TELEGRAM].texts_to(TG_GROUP))

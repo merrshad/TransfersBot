@@ -39,6 +39,13 @@ def new_pair_token() -> str:
     return secrets.token_urlsafe(18)
 
 
+def new_group_token(length: int = 8) -> str:
+    """Return a short, uppercase, single-use group pairing code."""
+    if length < 6:
+        raise ValueError("group token length must be >= 6")
+    return "".join(secrets.choice("23456789ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(length))
+
+
 def pair_deep_link(
     platform: Platform, bot_username: str, token: str
 ) -> str:
@@ -74,6 +81,7 @@ __all__ = [
     "PUBLIC_ID_ALPHABET",
     "PUBLIC_ID_LENGTH",
     "PUBLIC_ID_MAX_LENGTH",
+    "new_group_token",
     "new_pair_token",
     "new_public_id",
     "normalise_public_id",
