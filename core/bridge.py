@@ -510,7 +510,12 @@ class Bridge:
             await self._edit_group_notice(
                 callback,
                 "این گروه قبلاً وصل است. اول با «قطع سینک» آن را جدا کنید.",
-                buttons=((InlineButton("✂️ قطع سینک", "groupsync:off"),),),
+                buttons=(
+                    (
+                        InlineButton("✂️ قطع سینک", "groupsync:off"),
+                        InlineButton("🏠 منو", "groupsync:menu"),
+                    ),
+                ),
             )
             return
         target_platform = self._opposite_platform(callback.source)
@@ -530,7 +535,12 @@ class Bridge:
                 f"ربات را در گروه {self._group_platform_name(target_platform)} "
                 "عضو/ادمین کنید و یک پیام یا /groupsync در آن گروه بفرستید؛ "
                 "سپس دوباره تلاش کنید.",
-                buttons=((InlineButton("🔄 دوباره تلاش", "groupsync:pick"),),),
+                buttons=(
+                    (
+                        InlineButton("🔄 دوباره تلاش", "groupsync:pick"),
+                        InlineButton("🏠 منو", "groupsync:menu"),
+                    ),
+                ),
             )
             return
         labels = [self._known_group_name(target_platform, group.chat_id) for group in targets]
