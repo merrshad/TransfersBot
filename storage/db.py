@@ -32,6 +32,7 @@ from core.groups import (
     GroupLinkInvite,
     GroupLinkStatus,
     GroupMessage,
+    KnownGroup,
 )
 from core.ids import new_pair_token, new_public_id
 from core.models import MessageRecord, OutboxEntry, OutboxStats, OutboxStatus, Platform
@@ -364,6 +365,28 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX ix_group_link_invites_expiry ON group_link_invites (expires_at)",
         ),
     ),
+    Migration(
+        version=8,
+        description="groups discovered for the inline pairing menu",
+        statements=(
+            """
+            CREATE TABLE known_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                title TEXT,
+                discovered_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                CONSTRAINT uq_known_groups_chat UNIQUE (platform, chat_id),
+                CONSTRAINT ck_known_groups_platform CHECK (
+                    platform IN ('telegram', 'bale')
+                )
+            )
+            """,
+            "CREATE INDEX ix_known_groups_platform ON known_groups (platform, title)",
+        ),
+    ),
 )
 
 SCHEMA_VERSION_TABLE = "schema_version"
@@ -599,6 +622,19 @@ def _to_group_link_invite(row: sqlite3.Row) -> GroupLinkInvite:
         expires_at=from_db_time(row["expires_at"]),
         used_at=from_db_time(used_at) if used_at is not None else None,
         used_chat_id=int(used_chat_id) if used_chat_id is not None else None,
+    )
+
+
+def _to_known_group(row: sqlite3.Row) -> KnownGroup:
+    title = row["title"]
+    return KnownGroup(
+        id=int(row["id"]),
+        platform=Platform(row["platform"]),
+        chat_id=int(row["chat_id"]),
+        title=str(title) if title is not None else None,
+        discovered_by=int(row["discovered_by"]),
+        created_at=from_db_time(row["created_at"]),
+        last_seen_at=from_db_time(row["last_seen_at"]),
     )
 
 
@@ -1364,6 +1400,63 @@ class GroupLinkInviteRepository:
             (platform.value, chat_id),
         )
         return int(cursor.rowcount)
+
+
+class KnownGroupRepository:
+    """SQLite implementation of groups discovered from group updates."""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    @property
+    def _connection(self) -> sqlite3.Connection:
+        return self._db.connection
+
+    def upsert(
+        self,
+        *,
+        platform: Platform,
+        chat_id: int,
+        title: str | None,
+        discovered_by: int,
+        now: datetime,
+    ) -> KnownGroup:
+        """Insert or refresh one group's title and last-seen timestamp."""
+        moment = to_db_time(now)
+        self._connection.execute(
+            """
+            INSERT INTO known_groups
+                (platform, chat_id, title, discovered_by, created_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, chat_id) DO UPDATE SET
+                title = COALESCE(excluded.title, known_groups.title),
+                last_seen_at = excluded.last_seen_at
+            """,
+            (platform.value, chat_id, title, discovered_by, moment, moment),
+        )
+        row = self._connection.execute(
+            "SELECT * FROM known_groups WHERE platform = ? AND chat_id = ?",
+            (platform.value, chat_id),
+        ).fetchone()
+        if row is None:  # pragma: no cover
+            raise RuntimeError("known group disappeared after upsert")
+        return _to_known_group(row)
+
+    def get(self, platform: Platform, chat_id: int) -> KnownGroup | None:
+        """Fetch one known group."""
+        row = self._connection.execute(
+            "SELECT * FROM known_groups WHERE platform = ? AND chat_id = ?",
+            (platform.value, chat_id),
+        ).fetchone()
+        return _to_known_group(row) if row is not None else None
+
+    def list_by_platform(self, platform: Platform) -> tuple[KnownGroup, ...]:
+        """Every known group for one platform, oldest first."""
+        rows = self._connection.execute(
+            "SELECT * FROM known_groups WHERE platform = ? ORDER BY id",
+            (platform.value,),
+        ).fetchall()
+        return tuple(_to_known_group(row) for row in rows)
 
 
 class GroupMessageRepository:
@@ -2338,6 +2431,7 @@ class Repositories:
     outbox: OutboxRepository
     group_links: GroupLinkRepository
     group_invites: GroupLinkInviteRepository
+    known_groups: KnownGroupRepository
     group_messages: GroupMessageRepository
     group_outbox: GroupOutboxRepository
     poll_offsets: PollOffsetRepository
@@ -2356,6 +2450,7 @@ class Repositories:
             outbox=OutboxRepository(database),
             group_links=GroupLinkRepository(database),
             group_invites=GroupLinkInviteRepository(database),
+            known_groups=KnownGroupRepository(database),
             group_messages=GroupMessageRepository(database),
             group_outbox=GroupOutboxRepository(database),
             poll_offsets=PollOffsetRepository(database),
@@ -2379,6 +2474,7 @@ __all__ = [
     "GroupLinkRepository",
     "GroupMessageRepository",
     "GroupOutboxRepository",
+    "KnownGroupRepository",
     "MessageRepository",
     "Migration",
     "OutboxRepository",

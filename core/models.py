@@ -161,6 +161,7 @@ class UnifiedMessage:
     callback_id: str | None = None
     # Group bridging needs the chat kind and a human sender label.
     chat_type: str = "private"
+    chat_title: str | None = None
     sender_name: str | None = None
     is_bot_sender: bool = False
 

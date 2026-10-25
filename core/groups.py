@@ -124,6 +124,25 @@ class GroupLinkInvite:
 
 
 @dataclass(frozen=True, slots=True)
+class KnownGroup:
+    """A group the bot has seen, even before it is linked."""
+
+    id: int
+    platform: Platform
+    chat_id: int
+    title: str | None
+    discovered_by: int
+    created_at: datetime
+    last_seen_at: datetime
+
+    @property
+    def display_name(self) -> str:
+        """A safe, human-friendly label for inline buttons."""
+        raw = " ".join((self.title or "").split())
+        return raw or str(self.chat_id)
+
+
+@dataclass(frozen=True, slots=True)
 class GroupMessage:
     """Mapping between one source group message and its delivered copy."""
 
@@ -193,6 +212,31 @@ class GroupOutboxRepositoryPort(Protocol):
 
     def cancel_pending(self, group_link_id: int) -> int:
         """Delete queued-but-not-sent group deliveries for one link."""
+        ...
+
+
+@runtime_checkable
+class KnownGroupRepositoryPort(Protocol):
+    """Groups discovered from messages so the owner can pick one in a button."""
+
+    def upsert(
+        self,
+        *,
+        platform: Platform,
+        chat_id: int,
+        title: str | None,
+        discovered_by: int,
+        now: datetime,
+    ) -> KnownGroup:
+        """Insert/update a group's metadata and last-seen time."""
+        ...
+
+    def get(self, platform: Platform, chat_id: int) -> KnownGroup | None:
+        """Fetch a known group."""
+        ...
+
+    def list_by_platform(self, platform: Platform) -> tuple[KnownGroup, ...]:
+        """All known groups for one platform, oldest first."""
         ...
 
 
@@ -294,4 +338,6 @@ __all__ = [
     "GroupMessageRepositoryPort",
     "GroupOutboxRepositoryPort",
     "GroupOwnerOnlyError",
+    "KnownGroup",
+    "KnownGroupRepositoryPort",
 ]

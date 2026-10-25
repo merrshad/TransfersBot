@@ -209,6 +209,7 @@ def build_runtime(settings: Settings, repos: Repositories) -> Runtime:
         group_messages=repos.group_messages if group_sync_ready else None,
         group_outbox=repos.group_outbox if group_sync_ready else None,
         group_invites=repos.group_invites if group_sync_ready else None,
+        known_groups=repos.known_groups if group_sync_ready else None,
         group_invite_ttl=timedelta(minutes=settings.group_invite_ttl_minutes),
     )
     worker = OutboxWorker(

@@ -49,16 +49,18 @@ from core.formatting import render_relay_text
 from core.groups import (
     GroupAlreadyLinkedError,
     GroupInviteInvalidError,
+    GroupLink,
     GroupLinkInviteRepositoryPort,
     GroupLinkNotFoundError,
     GroupLinkRepositoryPort,
     GroupMessageRepositoryPort,
     GroupOutboxRepositoryPort,
     GroupOwnerOnlyError,
+    KnownGroupRepositoryPort,
 )
 from core.ids import new_group_token
 from core.media import RELAY_MEDIA_KIND, media_item_payload, unsupported_placeholder
-from core.models import MessageRef, Platform, SentMessage, UnifiedMessage
+from core.models import InlineButton, MessageRef, Platform, SentMessage, UnifiedMessage
 from core.pairing import Pair, PairingService
 from core.ports import (
     MessageRepositoryPort,
@@ -110,6 +112,7 @@ class Bridge:
         group_messages: GroupMessageRepositoryPort | None = None,
         group_outbox: GroupOutboxRepositoryPort | None = None,
         group_invites: GroupLinkInviteRepositoryPort | None = None,
+        known_groups: KnownGroupRepositoryPort | None = None,
         group_invite_ttl: timedelta = timedelta(minutes=15),
         clock: Callable[[], datetime] | None = None,
         logger: logging.Logger | None = None,
@@ -126,6 +129,7 @@ class Bridge:
         self._group_messages = group_messages
         self._group_outbox = group_outbox
         self._group_invites = group_invites
+        self._known_groups = known_groups
         self._group_invite_ttl = group_invite_ttl
         self._clock = clock or (lambda: datetime.now(UTC))
         self._log = logger or logging.getLogger("bridge.core")
@@ -208,8 +212,26 @@ class Bridge:
             return
 
         leader = messages[0]
+        if leader.callback_data is not None:
+            if self._group_links is not None and self._known_groups is not None:
+                self._record_known_group(leader)
+                try:
+                    await self._handle_group_callback(leader)
+                except DomainError as exc:
+                    await self._send_group_notice(leader, exc.message)
+                except Exception as exc:  # noqa: BLE001 - never poison polling
+                    self._log.error(
+                        "group callback failed platform=%s chat_id=%s (%s)",
+                        leader.source.value,
+                        leader.chat_id,
+                        type(exc).__name__,
+                    )
+                finally:
+                    await self._answer_callback(leader)
+            return
         if leader.is_bot_sender:
             return
+        self._record_known_group(leader)
         if (
             not leader.media
             and leader.text
@@ -327,17 +349,21 @@ class Bridge:
         return (
             "🔗 مدیریت سینک گروه‌ها (فقط مالک)\n\n"
             "/groupsync\n"
-            "ساخت کد اتصال برای همین گروه؛ کد را در گروه پلتفرم مقابل بفرستید.\n\n"
-            "/groupsync <کد>\n"
-            "تکمیل اتصال با کد گروه اول.\n\n"
-            "/groupsync off\n"
-            "قطع سینک این گروه.\n\n"
-            "/groupsync list\n"
-            "نمایش همهٔ جفت‌گروه‌های فعال."
+            "باز کردن منوی دکمه‌ای سینک گروه.\n\n"
+            "با دکمهٔ «اتصال به گروه»، گروه مقصد را از فهرست گروه‌های "
+            "شناخته‌شدهٔ پلتفرم مقابل انتخاب کنید.\n\n"
+            "اگر گروه مقصد در فهرست نبود، یک بار در آن گروه /groupsync "
+            "بفرستید تا ربات آن را بشناسد.\n\n"
+            "دکمه‌های «جفت‌ها» و «قطع سینک» وضعیت را نشان می‌دهند و "
+            "لینک را قطع می‌کنند."
         )
 
     async def _send_group_notice(
-        self, message: UnifiedMessage, text: str
+        self,
+        message: UnifiedMessage,
+        text: str,
+        *,
+        buttons: Sequence[Sequence[InlineButton]] = (),
     ) -> None:
         """Reply in the same group without going through the outbox."""
         sender = self._senders.get(message.source)
@@ -348,7 +374,7 @@ class Bridge:
             )
             return
         try:
-            await sender.send_message(message.chat_id, text)
+            await sender.send_message(message.chat_id, text, buttons=buttons)
         except MessagingError as exc:
             self._log.warning(
                 "group command reply failed platform=%s chat_id=%s (%s)",
@@ -356,6 +382,323 @@ class Bridge:
                 message.chat_id,
                 type(exc).__name__,
             )
+
+    async def _edit_group_notice(
+        self,
+        callback: UnifiedMessage,
+        text: str,
+        *,
+        buttons: Sequence[Sequence[InlineButton]] = (),
+    ) -> None:
+        """Edit the menu message that a button belongs to, with fallback."""
+        sender = self._senders.get(callback.source)
+        if sender is None:
+            return
+        if callback.message_id is not None:
+            try:
+                await sender.edit_message_text(
+                    callback.chat_id,
+                    callback.message_id,
+                    text,
+                    buttons=buttons,
+                )
+                return
+            except MessagingError as exc:
+                self._log.warning(
+                    "group menu edit failed platform=%s chat_id=%s (%s)",
+                    callback.source.value,
+                    callback.chat_id,
+                    type(exc).__name__,
+                )
+        await self._send_group_notice(callback, text, buttons=buttons)
+
+    def _record_known_group(self, message: UnifiedMessage) -> None:
+        """Remember every group the bot sees so the owner can pick it later."""
+        if self._known_groups is None:
+            return
+        try:
+            self._known_groups.upsert(
+                platform=message.source,
+                chat_id=message.chat_id,
+                title=message.chat_title,
+                discovered_by=message.sender_id,
+                now=self._clock(),
+            )
+        except Exception as exc:  # noqa: BLE001 - metadata must not stop relaying
+            self._log.warning(
+                "known group upsert failed platform=%s chat_id=%s (%s)",
+                message.source.value,
+                message.chat_id,
+                type(exc).__name__,
+            )
+
+    def _known_group_name(self, platform: Platform, chat_id: int) -> str:
+        group = (
+            self._known_groups.get(platform, chat_id)
+            if self._known_groups is not None
+            else None
+        )
+        return self._group_sender_label(
+            group.display_name if group is not None else str(chat_id)
+        )
+
+    @staticmethod
+    def _opposite_platform(source: Platform) -> Platform:
+        return Platform.BALE if source is Platform.TELEGRAM else Platform.TELEGRAM
+
+    def _group_menu_text(
+        self, message: UnifiedMessage, *, active: GroupLink | None
+    ) -> str:
+        name = self._known_group_name(message.source, message.chat_id)
+        if active is None:
+            status = "وضعیت: هنوز به گروهی وصل نیست."
+        else:
+            target_platform = self._opposite_platform(message.source)
+            target_id = (
+                active.bale_chat_id
+                if target_platform is Platform.BALE
+                else active.telegram_chat_id
+            )
+            status = (
+                f"وضعیت: وصل به {self._known_group_name(target_platform, target_id)}"
+            )
+        return (
+            "🔗 سینک گروه\n"
+            f"گروه: {name}\n"
+            f"{status}\n\n"
+            "یکی از گزینه‌ها را انتخاب کنید:"
+        )
+
+    def _group_menu_buttons(
+        self, *, active: bool
+    ) -> tuple[tuple[InlineButton, ...], ...]:
+        rows: list[tuple[InlineButton, ...]] = []
+        if not active:
+            rows.append((InlineButton("🔗 اتصال به گروه", "groupsync:pick"),))
+        rows.append(
+            (
+                InlineButton("📋 جفت‌ها", "groupsync:list"),
+                InlineButton("❓ راهنما", "groupsync:help"),
+            )
+        )
+        if active:
+            rows.append((InlineButton("✂️ قطع سینک", "groupsync:off"),))
+        return tuple(rows)
+
+    async def _show_group_menu(
+        self, message: UnifiedMessage, *, edit: bool = False
+    ) -> None:
+        if self._group_links is None:
+            return
+        active = self._group_links.get_active_for_source(
+            message.source, message.chat_id
+        )
+        text = self._group_menu_text(message, active=active)
+        buttons = self._group_menu_buttons(active=active is not None)
+        if edit:
+            await self._edit_group_notice(message, text, buttons=buttons)
+        else:
+            await self._send_group_notice(message, text, buttons=buttons)
+
+    async def _show_group_targets(self, callback: UnifiedMessage) -> None:
+        if self._group_links is None or self._known_groups is None:
+            return
+        active = self._group_links.get_active_for_source(
+            callback.source, callback.chat_id
+        )
+        if active is not None:
+            await self._edit_group_notice(
+                callback,
+                "این گروه قبلاً وصل است. اول با «قطع سینک» آن را جدا کنید.",
+                buttons=((InlineButton("✂️ قطع سینک", "groupsync:off"),),),
+            )
+            return
+        target_platform = self._opposite_platform(callback.source)
+        targets = [
+            group
+            for group in self._known_groups.list_by_platform(target_platform)
+            if self._group_links.get_active_for_source(
+                target_platform, group.chat_id
+            )
+            is None
+        ]
+        if not targets:
+            await self._edit_group_notice(
+                callback,
+                f"هنوز گروهی از {self._group_platform_name(target_platform)} "
+                "ثبت نشده است.\n"
+                f"ربات را در گروه {self._group_platform_name(target_platform)} "
+                "عضو/ادمین کنید و یک پیام یا /groupsync در آن گروه بفرستید؛ "
+                "سپس دوباره تلاش کنید.",
+                buttons=((InlineButton("🔄 دوباره تلاش", "groupsync:pick"),),),
+            )
+            return
+        labels = [self._known_group_name(target_platform, group.chat_id) for group in targets]
+        rows: list[tuple[InlineButton, ...]] = []
+        for index, group in enumerate(targets[:8]):
+            label = labels[index][:38]
+            if labels.count(labels[index]) > 1:
+                label = f"{label} ({group.chat_id})"
+            rows.append(
+                (
+                    InlineButton(
+                        label,
+                        f"groupsync:link:{group.chat_id}",
+                    ),
+                )
+            )
+        rows.append((InlineButton("🏠 منو", "groupsync:menu"),))
+        await self._edit_group_notice(
+            callback,
+            f"گروه {self._group_platform_name(target_platform)} مقصد را انتخاب کنید:",
+            buttons=tuple(rows),
+        )
+
+    async def _link_group_by_button(
+        self, callback: UnifiedMessage, target_chat_id: int
+    ) -> None:
+        if self._group_links is None or self._known_groups is None:
+            return
+        target_platform = self._opposite_platform(callback.source)
+        target = self._known_groups.get(target_platform, target_chat_id)
+        if target is None:
+            await self._edit_group_notice(
+                callback,
+                "گروه مقصد پیدا نشد. یک پیام در آن گروه بفرستید و دوباره تلاش کنید.",
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            return
+        if self._group_links.get_active_for_source(
+            callback.source, callback.chat_id
+        ) is not None or self._group_links.get_active_for_source(
+            target_platform, target_chat_id
+        ) is not None:
+            await self._edit_group_notice(
+                callback,
+                GroupAlreadyLinkedError().message,
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            return
+        if callback.source is Platform.TELEGRAM:
+            telegram_chat_id = callback.chat_id
+            bale_chat_id = target_chat_id
+        else:
+            telegram_chat_id = target_chat_id
+            bale_chat_id = callback.chat_id
+        try:
+            link = self._group_links.link(
+                telegram_chat_id=telegram_chat_id,
+                bale_chat_id=bale_chat_id,
+                now=self._clock(),
+            )
+        except GroupAlreadyLinkedError:
+            await self._edit_group_notice(
+                callback,
+                GroupAlreadyLinkedError().message,
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            return
+        await self._edit_group_notice(
+            callback,
+            "✅ سینک گروه‌ها فعال شد.\n"
+            f"تلگرام: {link.telegram_chat_id}\n"
+            f"بله: {link.bale_chat_id}",
+            buttons=(
+                (InlineButton("📋 جفت‌ها", "groupsync:list"),),
+                (InlineButton("✂️ قطع سینک", "groupsync:off"),),
+                (InlineButton("🏠 منو", "groupsync:menu"),),
+            ),
+        )
+        self._log.info(
+            "group link created link_id=%s telegram_chat=%s bale_chat=%s",
+            link.id,
+            link.telegram_chat_id,
+            link.bale_chat_id,
+        )
+
+    async def _show_group_links(
+        self, message: UnifiedMessage, *, edit: bool = False
+    ) -> None:
+        if self._group_links is None:
+            return
+        links = self._group_links.list_active()
+        if not links:
+            text = "هیچ جفت‌گروه فعالی وجود ندارد."
+        else:
+            lines = ["🔗 جفت‌گروه‌های فعال:"]
+            for index, link in enumerate(links, start=1):
+                lines.append(
+                    f"{index}) {self._known_group_name(Platform.TELEGRAM, link.telegram_chat_id)}"
+                    f" ↔ {self._known_group_name(Platform.BALE, link.bale_chat_id)}"
+                )
+            text = "\n".join(lines)
+        buttons: tuple[tuple[InlineButton, ...], ...] = (
+            ((InlineButton("🏠 منو", "groupsync:menu"),),) if edit else ()
+        )
+        if edit:
+            await self._edit_group_notice(message, text, buttons=buttons)
+        else:
+            await self._send_group_notice(message, text)
+
+    async def _disconnect_group_by_button(self, callback: UnifiedMessage) -> None:
+        if self._group_links is None or self._group_outbox is None:
+            return
+        link = self._group_links.get_active_for_source(
+            callback.source, callback.chat_id
+        )
+        if link is None:
+            await self._edit_group_notice(
+                callback,
+                GroupLinkNotFoundError().message,
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            return
+        self._group_links.deactivate(link.id, now=self._clock())
+        removed = self._group_outbox.cancel_pending(link.id)
+        await self._edit_group_notice(
+            callback,
+            "✅ سینک این گروه قطع شد.",
+            buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+        )
+        self._log.info(
+            "group link disconnected link_id=%s chat_id=%s cancelled=%s",
+            link.id,
+            callback.chat_id,
+            removed,
+        )
+
+    async def _show_group_help(self, callback: UnifiedMessage) -> None:
+        await self._edit_group_notice(
+            callback,
+            self._groupsync_help_text(),
+            buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+        )
+
+    async def _handle_group_callback(self, callback: UnifiedMessage) -> None:
+        """Handle the group pairing inline keyboard (owner only)."""
+        owner_id = self._owner_platform_ids.get(callback.source)
+        if owner_id != callback.sender_id:
+            return
+        data = callback.callback_data or ""
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else "menu"
+        if action == "pick":
+            await self._show_group_targets(callback)
+        elif action == "link" and len(parts) >= 3:
+            try:
+                target_chat_id = int(parts[2])
+            except ValueError:
+                await self._show_group_menu(callback, edit=True)
+                return
+            await self._link_group_by_button(callback, target_chat_id)
+        elif action == "list":
+            await self._show_group_links(callback, edit=True)
+        elif action == "off":
+            await self._disconnect_group_by_button(callback)
+        elif action == "help":
+            await self._show_group_help(callback)
+        else:
+            await self._show_group_menu(callback, edit=True)
 
     async def _handle_groupsync_command(
         self, message: UnifiedMessage, command: Command
@@ -368,7 +711,7 @@ class Bridge:
 
         args = command.args
         if not args:
-            await self._issue_group_invite(message)
+            await self._show_group_menu(message)
             return
         if len(args) > 1:
             await self._send_group_notice(message, self._groupsync_help_text())
@@ -379,7 +722,7 @@ class Bridge:
         if lowered in {"off", "stop", "unlink"}:
             await self._disconnect_group(message)
         elif lowered in {"list", "ls"}:
-            await self._list_group_links(message)
+            await self._show_group_links(message)
         elif lowered in {"help", "?", "h"}:
             await self._send_group_notice(message, self._groupsync_help_text())
         else:

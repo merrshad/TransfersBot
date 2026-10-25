@@ -389,6 +389,7 @@ def to_unified_message(update: Update) -> UnifiedMessage | None:
             callback_data=callback.data,
             callback_id=callback.id,
             chat_type=getattr(chat, "type", "private") if chat is not None else "private",
+            chat_title=getattr(chat, "title", None) if chat is not None else None,
             sender_name=_sender_name(callback.from_user),
             is_bot_sender=bool(getattr(callback.from_user, "is_bot", False)),
         )
@@ -440,6 +441,7 @@ def to_unified_message(update: Update) -> UnifiedMessage | None:
         media_group_id=str(message.media_group_id) if message.media_group_id else None,
         unsupported=unsupported,
         chat_type=chat.type,
+        chat_title=chat.title if isinstance(chat.title, str) else None,
         sender_name=_sender_name(sender),
         is_bot_sender=bool(getattr(sender, "is_bot", False)),
     )

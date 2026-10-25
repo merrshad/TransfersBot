@@ -97,8 +97,8 @@ def two_pairs(repos: Repositories) -> tuple[int, int]:
 
 
 def test_fresh_database_is_migrated_to_latest_version(repos: Repositories) -> None:
-    assert repos.db.schema_version() == 7
-    assert repos.db.applied_versions() == (1, 2, 3, 4, 5, 6, 7)
+    assert repos.db.schema_version() == 8
+    assert repos.db.applied_versions() == (1, 2, 3, 4, 5, 6, 7, 8)
 
 
 def test_schema_contains_all_required_tables(repos: Repositories) -> None:
@@ -118,6 +118,7 @@ def test_schema_contains_all_required_tables(repos: Repositories) -> None:
         "pairing_invites",
         "group_links",
         "group_link_invites",
+        "known_groups",
         "group_messages",
         "group_outbox",
         "poll_offsets",
@@ -139,13 +140,13 @@ def test_schema_contains_required_indexes(repos: Repositories) -> None:
 def test_schema_versions_are_recorded_exactly_once(repos: Repositories) -> None:
     total = sql(repos, "SELECT COUNT(*) AS total FROM schema_version").fetchone()["total"]
 
-    assert total == len(repos.db.applied_versions()) == 7
+    assert total == len(repos.db.applied_versions()) == 8
 
 
 def test_migrate_is_idempotent(repos: Repositories) -> None:
     before = repos.db.applied_versions()
 
-    assert repos.db.migrate() == 7
+    assert repos.db.migrate() == 8
     assert repos.db.applied_versions() == before
 
 
@@ -165,7 +166,7 @@ def test_reopening_a_file_database_keeps_data_and_skips_migrations(tmp_path: Pat
     second = Repositories.open(path)
     try:
         assert second.users.count() == 1
-        assert second.db.applied_versions() == (1, 2, 3, 4, 5, 6, 7)
+        assert second.db.applied_versions() == (1, 2, 3, 4, 5, 6, 7, 8)
     finally:
         second.close()
 
@@ -174,7 +175,7 @@ def test_in_memory_database_has_no_file() -> None:
     database = Database(":memory:")
     try:
         assert database.path == ":memory:"
-        assert database.schema_version() == 7
+        assert database.schema_version() == 8
     finally:
         database.close()
 
@@ -232,7 +233,7 @@ def test_migration_three_preserves_rows_and_backfills_timestamps(
 
     repos = Repositories.open(path)
     try:
-        assert repos.db.schema_version() == 7
+        assert repos.db.schema_version() == 8
         entry = repos.outbox.get_for_pair(1, 1)
         assert entry is not None
         assert entry.status is OutboxStatus.SENT

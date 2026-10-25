@@ -357,6 +357,7 @@ def parse_update(raw: Mapping[str, Any]) -> UnifiedMessage | None:
                 _as_str(chat.get("type")) if chat is not None else "private"
             )
             or "private",
+            chat_title=_as_str(chat.get("title")) if chat is not None else None,
             sender_name=_sender_name(sender),
             is_bot_sender=bool(sender.get("is_bot", False)),
         )
@@ -428,6 +429,7 @@ def parse_update(raw: Mapping[str, Any]) -> UnifiedMessage | None:
         media_group_id=media_group_id,
         unsupported=unsupported,
         chat_type=_as_str(chat.get("type")) or "private",
+        chat_title=_as_str(chat.get("title")),
         sender_name=_sender_name(sender),
         is_bot_sender=bool(sender.get("is_bot", False)),
     )
