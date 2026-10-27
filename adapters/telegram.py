@@ -30,6 +30,7 @@ from typing import Any, BinaryIO, Protocol, runtime_checkable
 from pydantic import SecretStr
 from telegram import (
     Bot,
+    ChatMember,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaAudio,
@@ -480,6 +481,12 @@ class TelegramBotPort(Protocol):
         """``getUpdates`` (see the Telegram Bot API)."""
         ...
 
+    async def get_chat_member(
+        self, chat_id: int, user_id: int
+    ) -> ChatMember:
+        """``getChatMember`` (see the Telegram Bot API)."""
+        ...
+
     async def send_message(
         self,
         chat_id: int,
@@ -713,6 +720,16 @@ class TelegramAdapter(BaseAdapter):
         )
 
     # --------------------------------------------------------------- sending
+
+    async def is_chat_admin(self, chat_id: int, user_id: int) -> bool:
+        """Check group membership through Telegram's ``getChatMember``."""
+        try:
+            member = await self._bot.get_chat_member(chat_id, user_id)
+        except TelegramError as exc:
+            raise translate_telegram_error(exc) from exc
+        status = getattr(member, "status", None)
+        value = getattr(status, "value", status)
+        return str(value).lower() in {"administrator", "creator"}
 
     async def send_message(
         self,

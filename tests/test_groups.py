@@ -9,7 +9,7 @@ import pytest
 from core.bridge import Bridge
 from core.commands import CommandRouter
 from core.delivery import GROUP_MEDIA_PAYLOAD_KIND, GROUP_TEXT_PAYLOAD_KIND, OutboxWorker
-from core.groups import GroupLinkStatus
+from core.groups import GroupLinkRequestStatus, GroupLinkStatus
 from core.ids import new_group_token
 from core.media import MediaPolicy, TempMediaStore
 from core.models import MediaItem, MediaKind, MessageRef, OutboxStatus, Platform, UnifiedMessage
@@ -57,8 +57,10 @@ def group_bridge(
         group_messages=repos.group_messages,
         group_outbox=repos.group_outbox,
         group_invites=repos.group_invites,
+        group_requests=repos.group_requests,
         known_groups=repos.known_groups,
         group_invite_ttl=timedelta(minutes=15),
+        group_link_request_ttl=timedelta(minutes=30),
         clock=lambda: FIXED_NOW,
     )
 
@@ -605,3 +607,246 @@ async def test_non_owner_button_does_not_change_links(
     )
 
     assert repos.group_links.list_active() == ()
+
+async def test_group_admin_can_open_the_menu(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    senders[Platform.TELEGRAM].admins.add((TG_GROUP, 7001))
+
+    await group_bridge.handle_message(
+        group_message(text="/groupsync", sender_id=7001, chat_title="گروه تلگرام")
+    )
+
+    call = senders[Platform.TELEGRAM].sent[-1]
+    assert "سینک گروه" in call.text
+    assert any(
+        button.callback_data == "groupsync:pick"
+        for row in call.buttons
+        for button in row
+    )
+
+
+async def test_admin_link_needs_target_admin_approval(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    senders[Platform.TELEGRAM].admins.add((TG_GROUP, 7001))
+    senders[Platform.BALE].admins.add((BALE_GROUP, 8001))
+    for platform, chat_id, title in (
+        (Platform.TELEGRAM, TG_GROUP, "گروه تلگرام"),
+        (Platform.BALE, BALE_GROUP, "گروه بله"),
+    ):
+        repos.known_groups.upsert(
+            platform=platform,
+            chat_id=chat_id,
+            title=title,
+            discovered_by=7001,
+            now=FIXED_NOW,
+        )
+
+    await group_bridge.handle_message(
+        group_message(text="/groupsync", sender_id=7001, chat_title="گروه تلگرام")
+    )
+    await group_bridge.handle_message(
+        group_message(
+            text=None,
+            message_id=601,
+            callback_data="groupsync:pick",
+            callback_id="cb-admin-pick",
+            sender_id=7001,
+            chat_title="گروه تلگرام",
+        )
+    )
+    await group_bridge.handle_message(
+        group_message(
+            text=None,
+            message_id=601,
+            callback_data=f"groupsync:link:{BALE_GROUP}",
+            callback_id="cb-admin-link",
+            sender_id=7001,
+            chat_title="گروه تلگرام",
+        )
+    )
+
+    request = repos.group_requests.find_pending_for_pair(
+        source_platform=Platform.TELEGRAM,
+        source_chat_id=TG_GROUP,
+        target_platform=Platform.BALE,
+        target_chat_id=BALE_GROUP,
+        now=FIXED_NOW,
+    )
+    assert request is not None
+    assert repos.group_links.list_active() == ()
+    prompt = senders[Platform.BALE].sent[-1]
+    assert "درخواست اتصال" in prompt.text
+    assert any(
+        button.callback_data == f"groupsync:approve:{request.id}"
+        for row in prompt.buttons
+        for button in row
+    )
+
+    await group_bridge.handle_message(
+        group_message(
+            platform=Platform.BALE,
+            chat_id=BALE_GROUP,
+            text=None,
+            message_id=999,
+            callback_data=f"groupsync:approve:{request.id}",
+            callback_id="cb-approve",
+            sender_id=8001,
+            chat_title="گروه بله",
+        )
+    )
+
+    linked = repos.group_links.get_active_for_source(Platform.TELEGRAM, TG_GROUP)
+    assert linked is not None
+    assert linked.bale_chat_id == BALE_GROUP
+    assert repos.group_requests.get(request.id).status is GroupLinkRequestStatus.APPROVED
+
+
+async def test_target_non_admin_cannot_approve(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    senders[Platform.TELEGRAM].admins.add((TG_GROUP, 7001))
+    for platform, chat_id in (
+        (Platform.TELEGRAM, TG_GROUP),
+        (Platform.BALE, BALE_GROUP),
+    ):
+        repos.known_groups.upsert(
+            platform=platform,
+            chat_id=chat_id,
+            title="گروه",
+            discovered_by=7001,
+            now=FIXED_NOW,
+        )
+    await group_bridge.handle_message(
+        group_message(text="/groupsync", sender_id=7001)
+    )
+    await group_bridge.handle_message(
+        group_message(
+            text=None,
+            message_id=602,
+            callback_data=f"groupsync:link:{BALE_GROUP}",
+            callback_id="cb-link-nonadmin",
+            sender_id=7001,
+        )
+    )
+    request = repos.group_requests.find_pending_for_pair(
+        source_platform=Platform.TELEGRAM,
+        source_chat_id=TG_GROUP,
+        target_platform=Platform.BALE,
+        target_chat_id=BALE_GROUP,
+        now=FIXED_NOW,
+    )
+    assert request is not None
+
+    await group_bridge.handle_message(
+        group_message(
+            platform=Platform.BALE,
+            chat_id=BALE_GROUP,
+            text=None,
+            message_id=998,
+            callback_data=f"groupsync:approve:{request.id}",
+            callback_id="cb-nonadmin-approve",
+            sender_id=8002,
+        )
+    )
+
+    assert repos.group_links.list_active() == ()
+    assert repos.group_requests.get(request.id).status is GroupLinkRequestStatus.PENDING
+
+
+async def test_target_admin_can_reject(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    senders[Platform.TELEGRAM].admins.add((TG_GROUP, 7001))
+    senders[Platform.BALE].admins.add((BALE_GROUP, 8001))
+    for platform, chat_id in (
+        (Platform.TELEGRAM, TG_GROUP),
+        (Platform.BALE, BALE_GROUP),
+    ):
+        repos.known_groups.upsert(
+            platform=platform,
+            chat_id=chat_id,
+            title="گروه",
+            discovered_by=7001,
+            now=FIXED_NOW,
+        )
+    await group_bridge.handle_message(
+        group_message(text="/groupsync", sender_id=7001)
+    )
+    await group_bridge.handle_message(
+        group_message(
+            text=None,
+            message_id=603,
+            callback_data=f"groupsync:link:{BALE_GROUP}",
+            callback_id="cb-link-reject",
+            sender_id=7001,
+        )
+    )
+    request = repos.group_requests.find_pending_for_pair(
+        source_platform=Platform.TELEGRAM,
+        source_chat_id=TG_GROUP,
+        target_platform=Platform.BALE,
+        target_chat_id=BALE_GROUP,
+        now=FIXED_NOW,
+    )
+    assert request is not None
+
+    await group_bridge.handle_message(
+        group_message(
+            platform=Platform.BALE,
+            chat_id=BALE_GROUP,
+            text=None,
+            message_id=997,
+            callback_data=f"groupsync:reject:{request.id}",
+            callback_id="cb-reject",
+            sender_id=8001,
+        )
+    )
+
+    assert repos.group_links.list_active() == ()
+    assert repos.group_requests.get(request.id).status is GroupLinkRequestStatus.REJECTED
+
+
+async def test_group_admin_can_disconnect(
+    group_bridge: Bridge, repos: Repositories, senders, link
+) -> None:
+    senders[Platform.TELEGRAM].admins.add((TG_GROUP, 7001))
+
+    await group_bridge.handle_message(
+        group_message(
+            text=None,
+            message_id=604,
+            callback_data="groupsync:off",
+            callback_id="cb-admin-off",
+            sender_id=7001,
+        )
+    )
+
+    assert repos.group_links.get_active_for_source(Platform.TELEGRAM, TG_GROUP) is None
+
+def test_expired_request_can_be_reissued(repos: Repositories) -> None:
+    first = repos.group_requests.create(
+        source_platform=Platform.TELEGRAM,
+        source_chat_id=TG_GROUP,
+        target_platform=Platform.BALE,
+        target_chat_id=BALE_GROUP,
+        created_by=7001,
+        created_at=FIXED_NOW,
+        expires_at=FIXED_NOW + timedelta(minutes=1),
+    )
+    second = repos.group_requests.create(
+        source_platform=Platform.TELEGRAM,
+        source_chat_id=TG_GROUP,
+        target_platform=Platform.BALE,
+        target_chat_id=BALE_GROUP,
+        created_by=7001,
+        created_at=FIXED_NOW + timedelta(minutes=2),
+        expires_at=FIXED_NOW + timedelta(minutes=32),
+    )
+
+    assert second.id != first.id
+    assert (
+        repos.group_requests.get(first.id).status
+        is GroupLinkRequestStatus.EXPIRED
+    )

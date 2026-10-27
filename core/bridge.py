@@ -53,9 +53,13 @@ from core.groups import (
     GroupLinkInviteRepositoryPort,
     GroupLinkNotFoundError,
     GroupLinkRepositoryPort,
+    GroupLinkRequest,
+    GroupLinkRequestRepositoryPort,
+    GroupLinkRequestStatus,
     GroupMessageRepositoryPort,
     GroupOutboxRepositoryPort,
     GroupOwnerOnlyError,
+    GroupRequestInvalidError,
     KnownGroupRepositoryPort,
 )
 from core.ids import new_group_token
@@ -112,8 +116,10 @@ class Bridge:
         group_messages: GroupMessageRepositoryPort | None = None,
         group_outbox: GroupOutboxRepositoryPort | None = None,
         group_invites: GroupLinkInviteRepositoryPort | None = None,
+        group_requests: GroupLinkRequestRepositoryPort | None = None,
         known_groups: KnownGroupRepositoryPort | None = None,
         group_invite_ttl: timedelta = timedelta(minutes=15),
+        group_link_request_ttl: timedelta = timedelta(minutes=30),
         clock: Callable[[], datetime] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -129,8 +135,10 @@ class Bridge:
         self._group_messages = group_messages
         self._group_outbox = group_outbox
         self._group_invites = group_invites
+        self._group_requests = group_requests
         self._known_groups = known_groups
         self._group_invite_ttl = group_invite_ttl
+        self._group_link_request_ttl = group_link_request_ttl
         self._clock = clock or (lambda: datetime.now(UTC))
         self._log = logger or logging.getLogger("bridge.core")
 
@@ -208,6 +216,7 @@ class Bridge:
             or self._group_messages is None
             or self._group_outbox is None
             or self._group_invites is None
+            or self._group_requests is None
         ):
             return
 
@@ -347,11 +356,14 @@ class Bridge:
     @staticmethod
     def _groupsync_help_text() -> str:
         return (
-            "🔗 مدیریت سینک گروه‌ها (فقط مالک)\n\n"
+            "🔗 مدیریت سینک گروه‌ها (مالک ربات یا ادمین گروه)\n\n"
             "/groupsync\n"
             "باز کردن منوی دکمه‌ای سینک گروه.\n\n"
             "با دکمهٔ «اتصال به گروه»، گروه مقصد را از فهرست گروه‌های "
             "شناخته‌شدهٔ پلتفرم مقابل انتخاب کنید.\n\n"
+            "اگر شما ادمین گروه باشید، درخواست اتصال برای گروه مقصد ارسال "
+            "می‌شود و یکی از ادمین‌های آن گروه باید با دکمه تأیید کند. "
+            "مالک ربات می‌تواند بدون این مرحله مستقیم وصل کند.\n\n"
             "اگر گروه مقصد در فهرست نبود، یک بار در آن گروه /groupsync "
             "بفرستید تا ربات آن را بشناسد.\n\n"
             "دکمه‌های «جفت‌ها» و «قطع سینک» وضعیت را نشان می‌دهند و "
@@ -411,6 +423,42 @@ class Bridge:
                     type(exc).__name__,
                 )
         await self._send_group_notice(callback, text, buttons=buttons)
+
+    async def _is_group_authorized(self, message: UnifiedMessage) -> bool:
+        """Owner or a current platform-verified admin of this group."""
+        if self._owner_platform_ids.get(message.source) == message.sender_id:
+            return True
+        sender = self._senders.get(message.source)
+        if sender is None:
+            return False
+        try:
+            allowed = await sender.is_chat_admin(
+                message.chat_id, message.sender_id
+            )
+        except MessagingError as exc:
+            self._log.warning(
+                "group admin check failed platform=%s chat_id=%s (%s)",
+                message.source.value,
+                message.chat_id,
+                type(exc).__name__,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            self._log.warning(
+                "group admin check crashed platform=%s chat_id=%s (%s)",
+                message.source.value,
+                message.chat_id,
+                type(exc).__name__,
+            )
+            return False
+        if not allowed:
+            self._log.info(
+                "group action denied platform=%s chat_id=%s sender_id=%s",
+                message.source.value,
+                message.chat_id,
+                message.sender_id,
+            )
+        return allowed
 
     def _record_known_group(self, message: UnifiedMessage) -> None:
         """Remember every group the bot sees so the owner can pick it later."""
@@ -578,6 +626,9 @@ class Bridge:
                 buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
             )
             return
+        if self._owner_platform_ids.get(callback.source) != callback.sender_id:
+            await self._request_group_link(callback, target_chat_id)
+            return
         if self._group_links.get_active_for_source(
             callback.source, callback.chat_id
         ) is not None or self._group_links.get_active_for_source(
@@ -624,6 +675,242 @@ class Bridge:
             link.id,
             link.telegram_chat_id,
             link.bale_chat_id,
+        )
+
+    async def _send_to_group_chat(
+        self,
+        platform: Platform,
+        chat_id: int,
+        text: str,
+        *,
+        buttons: Sequence[Sequence[InlineButton]] = (),
+    ) -> bool:
+        """Send to an arbitrary group; return whether the API accepted it."""
+        sender = self._senders.get(platform)
+        if sender is None:
+            return False
+        try:
+            await sender.send_message(chat_id, text, buttons=buttons)
+            return True
+        except MessagingError as exc:
+            self._log.warning(
+                "group notice failed platform=%s chat_id=%s (%s)",
+                platform.value,
+                chat_id,
+                type(exc).__name__,
+            )
+            return False
+
+    async def _request_group_link(
+        self, callback: UnifiedMessage, target_chat_id: int
+    ) -> None:
+        """Admin-initiated link: ask an admin of the target group to approve."""
+        if (
+            self._group_links is None
+            or self._known_groups is None
+            or self._group_requests is None
+        ):
+            return
+        target_platform = self._opposite_platform(callback.source)
+        if self._group_links.get_active_for_source(
+            callback.source, callback.chat_id
+        ) is not None or self._group_links.get_active_for_source(
+            target_platform, target_chat_id
+        ) is not None:
+            await self._edit_group_notice(
+                callback,
+                GroupAlreadyLinkedError().message,
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            return
+        now = self._clock()
+        existing = self._group_requests.find_pending_for_pair(
+            source_platform=callback.source,
+            source_chat_id=callback.chat_id,
+            target_platform=target_platform,
+            target_chat_id=target_chat_id,
+            now=now,
+        )
+        request = existing or self._group_requests.create(
+            source_platform=callback.source,
+            source_chat_id=callback.chat_id,
+            target_platform=target_platform,
+            target_chat_id=target_chat_id,
+            created_by=callback.sender_id,
+            created_at=now,
+            expires_at=now + self._group_link_request_ttl,
+        )
+        source_name = self._known_group_name(
+            callback.source, callback.chat_id
+        )
+        target_name = self._known_group_name(
+            target_platform, target_chat_id
+        )
+        minutes = max(1, int(self._group_link_request_ttl.total_seconds() // 60))
+        prompt = (
+            "🔗 درخواست اتصال گروه\n"
+            f"از: {source_name}\n\n"
+            "برای فعال‌شدن سینک، یکی از ادمین‌های این گروه تأیید کند.\n"
+            f"اعتبار: {minutes} دقیقه"
+        )
+        buttons = (
+            (
+                InlineButton(
+                    "✅ تأیید اتصال", f"groupsync:approve:{request.id}"
+                ),
+                InlineButton("❌ رد", f"groupsync:reject:{request.id}"),
+            ),
+        )
+        sent = await self._send_to_group_chat(
+            target_platform, target_chat_id, prompt, buttons=buttons
+        )
+        if not sent:
+            self._group_requests.reject(
+                request.id, resolved_by=callback.sender_id, now=now
+            )
+            await self._edit_group_notice(
+                callback,
+                "ارسال درخواست به گروه مقصد ناموفق بود. دوباره تلاش کنید.",
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            return
+        await self._edit_group_notice(
+            callback,
+            "📨 درخواست اتصال ارسال شد.\n"
+            f"مقصد: {target_name}\n"
+            "منتظر تأیید یکی از ادمین‌های گروه مقصد باشید.",
+            buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+        )
+        self._log.info(
+            "group request created request_id=%s source_chat=%s target_chat=%s",
+            request.id,
+            callback.chat_id,
+            target_chat_id,
+        )
+
+    async def _resolve_group_request(
+        self,
+        callback: UnifiedMessage,
+        request_id: int,
+        *,
+        approve: bool,
+    ) -> None:
+        """Approve/reject a request from the target group's admin keyboard."""
+        if self._group_requests is None or self._group_links is None:
+            return
+        request = self._group_requests.get(request_id)
+        if (
+            request is None
+            or request.target_platform is not callback.source
+            or request.target_chat_id != callback.chat_id
+            or request.status is not GroupLinkRequestStatus.PENDING
+        ):
+            await self._edit_group_notice(
+                callback,
+                GroupRequestInvalidError().message,
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            return
+        now = self._clock()
+        if request.expires_at <= now:
+            self._group_requests.expire(request_id, now=now)
+            await self._edit_group_notice(
+                callback,
+                "⏳ مهلت این درخواست تمام شده است. درخواست جدید بفرستید.",
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            await self._notify_group_request_source(
+                request, "⏳ مهلت درخواست اتصال گروه تمام شد."
+            )
+            return
+
+        if not approve:
+            self._group_requests.reject(
+                request_id, resolved_by=callback.sender_id, now=now
+            )
+            await self._edit_group_notice(
+                callback,
+                "❌ درخواست اتصال رد شد.",
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            await self._notify_group_request_source(
+                request, "❌ درخواست اتصال گروه توسط گروه مقصد رد شد."
+            )
+            return
+
+        if self._group_links.get_active_for_source(
+            request.source_platform, request.source_chat_id
+        ) is not None or self._group_links.get_active_for_source(
+            request.target_platform, request.target_chat_id
+        ) is not None:
+            self._group_requests.reject(
+                request_id, resolved_by=callback.sender_id, now=now
+            )
+            await self._edit_group_notice(
+                callback,
+                GroupAlreadyLinkedError().message,
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            await self._notify_group_request_source(
+                request, "⚠️ یکی از گروه‌ها قبلاً به گروه دیگری وصل شده است."
+            )
+            return
+
+        approved = self._group_requests.approve(
+            request_id, resolved_by=callback.sender_id, now=now
+        )
+        if approved is None:
+            await self._edit_group_notice(
+                callback,
+                GroupRequestInvalidError().message,
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            return
+        if request.source_platform is Platform.TELEGRAM:
+            telegram_chat_id = request.source_chat_id
+            bale_chat_id = request.target_chat_id
+        else:
+            telegram_chat_id = request.target_chat_id
+            bale_chat_id = request.source_chat_id
+        try:
+            link = self._group_links.link(
+                telegram_chat_id=telegram_chat_id,
+                bale_chat_id=bale_chat_id,
+                now=now,
+            )
+        except GroupAlreadyLinkedError:
+            await self._edit_group_notice(
+                callback,
+                GroupAlreadyLinkedError().message,
+                buttons=((InlineButton("🏠 منو", "groupsync:menu"),),),
+            )
+            return
+        await self._edit_group_notice(
+            callback,
+            "✅ اتصال تأیید شد.\n"
+            f"تلگرام: {link.telegram_chat_id}\n"
+            f"بله: {link.bale_chat_id}",
+            buttons=(
+                (InlineButton("📋 جفت‌ها", "groupsync:list"),),
+                (InlineButton("✂️ قطع سینک", "groupsync:off"),),
+                (InlineButton("🏠 منو", "groupsync:menu"),),
+            ),
+        )
+        await self._notify_group_request_source(
+            request, "✅ درخواست اتصال گروه تأیید شد و سینک فعال است."
+        )
+        self._log.info(
+            "group request approved request_id=%s link_id=%s",
+            request.id,
+            link.id,
+        )
+
+    async def _notify_group_request_source(
+        self, request: GroupLinkRequest, text: str
+    ) -> None:
+        """Inform the source group about the target admin's decision."""
+        await self._send_to_group_chat(
+            request.source_platform, request.source_chat_id, text
         )
 
     async def _show_group_links(
@@ -685,9 +972,8 @@ class Bridge:
         )
 
     async def _handle_group_callback(self, callback: UnifiedMessage) -> None:
-        """Handle the group pairing inline keyboard (owner only)."""
-        owner_id = self._owner_platform_ids.get(callback.source)
-        if owner_id != callback.sender_id:
+        """Handle the group pairing keyboard for the owner or a group admin."""
+        if not await self._is_group_authorized(callback):
             return
         data = callback.callback_data or ""
         parts = data.split(":")
@@ -701,6 +987,15 @@ class Bridge:
                 await self._show_group_menu(callback, edit=True)
                 return
             await self._link_group_by_button(callback, target_chat_id)
+        elif action in {"approve", "reject"} and len(parts) >= 3:
+            try:
+                request_id = int(parts[2])
+            except ValueError:
+                await self._show_group_menu(callback, edit=True)
+                return
+            await self._resolve_group_request(
+                callback, request_id, approve=action == "approve"
+            )
         elif action == "list":
             await self._show_group_links(callback, edit=True)
         elif action == "off":
@@ -713,9 +1008,8 @@ class Bridge:
     async def _handle_groupsync_command(
         self, message: UnifiedMessage, command: Command
     ) -> None:
-        """Owner-only group link management from inside a group."""
-        owner_id = self._owner_platform_ids.get(message.source)
-        if owner_id != message.sender_id:
+        """Owner/group-admin link management from inside a group."""
+        if not await self._is_group_authorized(message):
             await self._send_group_notice(message, GroupOwnerOnlyError().message)
             return
 

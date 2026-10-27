@@ -30,6 +30,8 @@ from core.groups import (
     GroupAlreadyLinkedError,
     GroupLink,
     GroupLinkInvite,
+    GroupLinkRequest,
+    GroupLinkRequestStatus,
     GroupLinkStatus,
     GroupMessage,
     KnownGroup,
@@ -387,6 +389,44 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX ix_known_groups_platform ON known_groups (platform, title)",
         ),
     ),
+    Migration(
+        version=9,
+        description="cross-group link requests approved by target admins",
+        statements=(
+            """
+            CREATE TABLE group_link_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_platform TEXT NOT NULL,
+                source_chat_id INTEGER NOT NULL,
+                target_platform TEXT NOT NULL,
+                target_chat_id INTEGER NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                resolved_by INTEGER,
+                resolved_at TEXT,
+                CONSTRAINT ck_group_link_requests_source CHECK (
+                    source_platform IN ('telegram', 'bale')
+                ),
+                CONSTRAINT ck_group_link_requests_target CHECK (
+                    target_platform IN ('telegram', 'bale')
+                ),
+                CONSTRAINT ck_group_link_requests_status CHECK (
+                    status IN ('pending', 'approved', 'rejected', 'expired')
+                )
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX ux_group_link_requests_pending
+            ON group_link_requests (
+                source_platform, source_chat_id, target_platform, target_chat_id
+            )
+            WHERE status = 'pending'
+            """,
+            "CREATE INDEX ix_group_link_requests_target ON group_link_requests (target_platform, target_chat_id, status)",
+        ),
+    ),
 )
 
 SCHEMA_VERSION_TABLE = "schema_version"
@@ -635,6 +675,24 @@ def _to_known_group(row: sqlite3.Row) -> KnownGroup:
         discovered_by=int(row["discovered_by"]),
         created_at=from_db_time(row["created_at"]),
         last_seen_at=from_db_time(row["last_seen_at"]),
+    )
+
+
+def _to_group_link_request(row: sqlite3.Row) -> GroupLinkRequest:
+    resolved_by = row["resolved_by"]
+    resolved_at = row["resolved_at"]
+    return GroupLinkRequest(
+        id=int(row["id"]),
+        source_platform=Platform(row["source_platform"]),
+        source_chat_id=int(row["source_chat_id"]),
+        target_platform=Platform(row["target_platform"]),
+        target_chat_id=int(row["target_chat_id"]),
+        created_by=int(row["created_by"]),
+        created_at=from_db_time(row["created_at"]),
+        expires_at=from_db_time(row["expires_at"]),
+        status=GroupLinkRequestStatus(row["status"]),
+        resolved_by=int(resolved_by) if resolved_by is not None else None,
+        resolved_at=from_db_time(resolved_at) if resolved_at is not None else None,
     )
 
 
@@ -1400,6 +1458,170 @@ class GroupLinkInviteRepository:
             (platform.value, chat_id),
         )
         return int(cursor.rowcount)
+
+
+class GroupLinkRequestRepository:
+    """SQLite implementation of cross-group link requests."""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    @property
+    def _connection(self) -> sqlite3.Connection:
+        return self._db.connection
+
+    def create(
+        self,
+        *,
+        source_platform: Platform,
+        source_chat_id: int,
+        target_platform: Platform,
+        target_chat_id: int,
+        created_by: int,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> GroupLinkRequest:
+        """Create a pending request, reusing an existing live duplicate."""
+        # A stale pending row still occupies the partial unique index. Expire
+        # it first so a new request for the same pair can be created.
+        self._connection.execute(
+            """
+            UPDATE group_link_requests
+            SET status = 'expired', resolved_at = ?
+            WHERE source_platform = ? AND source_chat_id = ?
+              AND target_platform = ? AND target_chat_id = ?
+              AND status = 'pending' AND expires_at <= ?
+            """,
+            (
+                to_db_time(created_at),
+                source_platform.value,
+                source_chat_id,
+                target_platform.value,
+                target_chat_id,
+                to_db_time(created_at),
+            ),
+        )
+        try:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO group_link_requests
+                    (source_platform, source_chat_id, target_platform,
+                     target_chat_id, created_by, created_at, expires_at,
+                     status, resolved_by, resolved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL)
+                """,
+                (
+                    source_platform.value,
+                    source_chat_id,
+                    target_platform.value,
+                    target_chat_id,
+                    created_by,
+                    to_db_time(created_at),
+                    to_db_time(expires_at),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            existing = self.find_pending_for_pair(
+                source_platform=source_platform,
+                source_chat_id=source_chat_id,
+                target_platform=target_platform,
+                target_chat_id=target_chat_id,
+                now=created_at,
+            )
+            if existing is not None:
+                return existing
+            raise
+        row = self._connection.execute(
+            "SELECT * FROM group_link_requests WHERE id = ?",
+            (_last_row_id(cursor),),
+        ).fetchone()
+        if row is None:  # pragma: no cover
+            raise RuntimeError("group request disappeared after insert")
+        return _to_group_link_request(row)
+
+    def get(self, request_id: int) -> GroupLinkRequest | None:
+        """Fetch a request by id."""
+        row = self._connection.execute(
+            "SELECT * FROM group_link_requests WHERE id = ?", (request_id,)
+        ).fetchone()
+        return _to_group_link_request(row) if row is not None else None
+
+    def find_pending_for_pair(
+        self,
+        *,
+        source_platform: Platform,
+        source_chat_id: int,
+        target_platform: Platform,
+        target_chat_id: int,
+        now: datetime,
+    ) -> GroupLinkRequest | None:
+        """Return the live pending request for one source/target pair."""
+        row = self._connection.execute(
+            """
+            SELECT * FROM group_link_requests
+            WHERE source_platform = ? AND source_chat_id = ?
+              AND target_platform = ? AND target_chat_id = ?
+              AND status = 'pending' AND expires_at > ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (
+                source_platform.value,
+                source_chat_id,
+                target_platform.value,
+                target_chat_id,
+                to_db_time(now),
+            ),
+        ).fetchone()
+        return _to_group_link_request(row) if row is not None else None
+
+    def approve(
+        self, request_id: int, *, resolved_by: int, now: datetime
+    ) -> GroupLinkRequest | None:
+        """Approve a pending, unexpired request."""
+        cursor = self._connection.execute(
+            """
+            UPDATE group_link_requests
+            SET status = 'approved', resolved_by = ?, resolved_at = ?
+            WHERE id = ? AND status = 'pending' AND expires_at > ?
+            """,
+            (resolved_by, to_db_time(now), request_id, to_db_time(now)),
+        )
+        if cursor.rowcount == 0:
+            return None
+        return self.get(request_id)
+
+    def reject(
+        self, request_id: int, *, resolved_by: int, now: datetime
+    ) -> GroupLinkRequest | None:
+        """Reject a pending request."""
+        cursor = self._connection.execute(
+            """
+            UPDATE group_link_requests
+            SET status = 'rejected', resolved_by = ?, resolved_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (resolved_by, to_db_time(now), request_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        return self.get(request_id)
+
+    def expire(
+        self, request_id: int, *, now: datetime
+    ) -> GroupLinkRequest | None:
+        """Mark an expired pending request as expired."""
+        cursor = self._connection.execute(
+            """
+            UPDATE group_link_requests
+            SET status = 'expired', resolved_at = ?
+            WHERE id = ? AND status = 'pending' AND expires_at <= ?
+            """,
+            (to_db_time(now), request_id, to_db_time(now)),
+        )
+        if cursor.rowcount == 0:
+            return self.get(request_id)
+        return self.get(request_id)
 
 
 class KnownGroupRepository:
@@ -2431,6 +2653,7 @@ class Repositories:
     outbox: OutboxRepository
     group_links: GroupLinkRepository
     group_invites: GroupLinkInviteRepository
+    group_requests: GroupLinkRequestRepository
     known_groups: KnownGroupRepository
     group_messages: GroupMessageRepository
     group_outbox: GroupOutboxRepository
@@ -2450,6 +2673,7 @@ class Repositories:
             outbox=OutboxRepository(database),
             group_links=GroupLinkRepository(database),
             group_invites=GroupLinkInviteRepository(database),
+            group_requests=GroupLinkRequestRepository(database),
             known_groups=KnownGroupRepository(database),
             group_messages=GroupMessageRepository(database),
             group_outbox=GroupOutboxRepository(database),
@@ -2472,6 +2696,7 @@ __all__ = [
     "Database",
     "GroupLinkInviteRepository",
     "GroupLinkRepository",
+    "GroupLinkRequestRepository",
     "GroupMessageRepository",
     "GroupOutboxRepository",
     "KnownGroupRepository",

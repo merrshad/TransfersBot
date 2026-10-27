@@ -53,6 +53,15 @@ class MessageSenderPort(Protocol):
         """Messenger this sender talks to."""
         ...
 
+    async def is_chat_admin(self, chat_id: int, user_id: int) -> bool:
+        """Whether ``user_id`` is an administrator/creator of ``chat_id``.
+
+        Raises:
+            MessagingError: If the platform cannot answer the membership query.
+                Callers must fail closed and deny the operation.
+        """
+        ...
+
     async def send_message(
         self,
         chat_id: int,

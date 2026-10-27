@@ -65,6 +65,9 @@ class ScriptedAdapter(BaseAdapter):
     def platform(self) -> Platform:
         return self._platform
 
+    async def is_chat_admin(self, chat_id: int, user_id: int) -> bool:
+        return False
+
     async def poll_once(self, offset: int | None, *, timeout: int) -> PollResult:
         self.poll_offsets.append(offset)
         self.timeouts.append(timeout)

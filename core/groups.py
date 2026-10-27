@@ -18,12 +18,16 @@ from core.models import OutboxEntry, Platform
 
 
 class GroupOwnerOnlyError(DomainError):
-    """Raised when someone other than the configured owner tries to link groups."""
+    """Raised when neither the bot owner nor a group admin may link groups."""
 
     code = "group_owner_only"
 
     def __init__(
-        self, message: str = "⛔️ فقط مالک ربات می‌تواند گروه‌ها را جفت کند."
+        self,
+        message: str = (
+            "⛔️ فقط مالک ربات یا یکی از ادمین‌های همین گروه می‌تواند "
+            "گروه‌ها را جفت کند."
+        ),
     ) -> None:
         super().__init__(message)
 
@@ -69,11 +73,32 @@ class GroupLinkNotFoundError(DomainError):
         super().__init__(message)
 
 
+class GroupRequestInvalidError(DomainError):
+    """Raised when a pending cross-group link request cannot be resolved."""
+
+    code = "group_request_invalid"
+
+    def __init__(
+        self,
+        message: str = "درخواست اتصال معتبر نیست یا منقضی شده است.",
+    ) -> None:
+        super().__init__(message)
+
+
 class GroupLinkStatus(str, Enum):
     """Lifecycle of a group-to-group bridge."""
 
     ACTIVE = "active"
     INACTIVE = "inactive"
+
+
+class GroupLinkRequestStatus(str, Enum):
+    """Lifecycle of a cross-group link request."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +165,28 @@ class KnownGroup:
         """A safe, human-friendly label for inline buttons."""
         raw = " ".join((self.title or "").split())
         return raw or str(self.chat_id)
+
+
+@dataclass(frozen=True, slots=True)
+class GroupLinkRequest:
+    """A pending request from one group admin to link another group."""
+
+    id: int
+    source_platform: Platform
+    source_chat_id: int
+    target_platform: Platform
+    target_chat_id: int
+    created_by: int
+    created_at: datetime
+    expires_at: datetime
+    status: GroupLinkRequestStatus
+    resolved_by: int | None
+    resolved_at: datetime | None
+
+    @property
+    def is_pending(self) -> bool:
+        """Whether the request still waits for a target-group admin."""
+        return self.status is GroupLinkRequestStatus.PENDING
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +288,57 @@ class KnownGroupRepositoryPort(Protocol):
 
 
 @runtime_checkable
+class GroupLinkRequestRepositoryPort(Protocol):
+    """Persistence for cross-group link requests approved by both sides."""
+
+    def create(
+        self,
+        *,
+        source_platform: Platform,
+        source_chat_id: int,
+        target_platform: Platform,
+        target_chat_id: int,
+        created_by: int,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> GroupLinkRequest:
+        """Create a pending request."""
+        ...
+
+    def get(self, request_id: int) -> GroupLinkRequest | None:
+        """Fetch a request by id."""
+        ...
+
+    def find_pending_for_pair(
+        self,
+        *,
+        source_platform: Platform,
+        source_chat_id: int,
+        target_platform: Platform,
+        target_chat_id: int,
+        now: datetime,
+    ) -> GroupLinkRequest | None:
+        """Return the live pending request for one source/target pair."""
+        ...
+
+    def approve(
+        self, request_id: int, *, resolved_by: int, now: datetime
+    ) -> GroupLinkRequest | None:
+        """Atomically approve a pending, unexpired request."""
+        ...
+
+    def reject(
+        self, request_id: int, *, resolved_by: int, now: datetime
+    ) -> GroupLinkRequest | None:
+        """Reject a pending request."""
+        ...
+
+    def expire(self, request_id: int, *, now: datetime) -> GroupLinkRequest | None:
+        """Mark an expired pending request as expired."""
+        ...
+
+
+@runtime_checkable
 class GroupLinkInviteRepositoryPort(Protocol):
     """Persistence for single-use, owner-created group pairing codes."""
 
@@ -333,11 +431,15 @@ __all__ = [
     "GroupLinkInviteRepositoryPort",
     "GroupLinkNotFoundError",
     "GroupLinkRepositoryPort",
+    "GroupLinkRequest",
+    "GroupLinkRequestRepositoryPort",
+    "GroupLinkRequestStatus",
     "GroupLinkStatus",
     "GroupMessage",
     "GroupMessageRepositoryPort",
     "GroupOutboxRepositoryPort",
     "GroupOwnerOnlyError",
+    "GroupRequestInvalidError",
     "KnownGroup",
     "KnownGroupRepositoryPort",
 ]

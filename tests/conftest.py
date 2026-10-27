@@ -181,6 +181,7 @@ class RecordingSender:
         self.download_error: MessagingError | None = None
         self.media_error: MessagingError | None = None
         self.album_error: MessagingError | None = None
+        self.admins: set[tuple[int, int]] = set()
         self._next_id = 1000
 
     @property
@@ -199,6 +200,10 @@ class RecordingSender:
     def media_to(self) -> list[SentMediaCall]:
         """Every media delivery, in order."""
         return list(self.media)
+
+    async def is_chat_admin(self, chat_id: int, user_id: int) -> bool:
+        """Fake membership query; tests opt users in explicitly."""
+        return (chat_id, user_id) in self.admins
 
     async def send_message(
         self,

@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     telegram_group_id: int | None = None
     bale_group_id: int | None = None
     group_invite_ttl_minutes: int = Field(default=15, ge=1)
+    group_link_request_ttl_minutes: int = Field(default=30, ge=1)
     db_path: Path = Path("data/bridge.db")
     log_level: LogLevel = "INFO"
     poll_timeout_seconds: int = Field(default=25, ge=1, le=300)

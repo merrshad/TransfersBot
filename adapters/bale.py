@@ -515,6 +515,18 @@ class BaleAdapter(BaseAdapter):
             body = None
         return parse_api_response(response.status_code, body)
 
+    async def is_chat_admin(self, chat_id: int, user_id: int) -> bool:
+        """Check group membership through Bale's ``getChatMember``."""
+        result = await self._call(
+            "getChatMember", {"chat_id": chat_id, "user_id": user_id}
+        )
+        if not isinstance(result, Mapping):
+            raise ApiError(
+                "Bale getChatMember returned an unexpected payload",
+                platform=Platform.BALE.value,
+            )
+        return str(result.get("status", "")).lower() in {"administrator", "creator"}
+
     async def get_me(self) -> Mapping[str, Any]:
         """Call ``getMe`` and return the bot user (startup sanity check)."""
         result = await self._call("getMe", {})

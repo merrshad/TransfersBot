@@ -182,6 +182,11 @@ class BaseAdapter(ABC):
         ...
 
     @abstractmethod
+    async def is_chat_admin(self, chat_id: int, user_id: int) -> bool:
+        """Whether a platform user administers a group."""
+        ...
+
+    @abstractmethod
     async def poll_once(self, offset: int | None, *, timeout: int) -> PollResult:
         """Fetch pending updates once, using long polling for up to ``timeout``.
 
