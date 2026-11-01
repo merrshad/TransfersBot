@@ -850,3 +850,46 @@ def test_expired_request_can_be_reissued(repos: Repositories) -> None:
         repos.group_requests.get(first.id).status
         is GroupLinkRequestStatus.EXPIRED
     )
+
+async def test_owner_start_opens_group_menu_without_groupsync(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    await group_bridge.handle_message(
+        group_message(text="/start", sender_id=9001, chat_title="گروه تلگرام")
+    )
+
+    call = senders[Platform.TELEGRAM].sent[-1]
+    assert "سینک گروه" in call.text
+    assert any(
+        button.callback_data == "groupsync:pick"
+        for row in call.buttons
+        for button in row
+    )
+
+
+async def test_group_admin_start_opens_group_menu(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    senders[Platform.TELEGRAM].admins.add((TG_GROUP, 7001))
+
+    await group_bridge.handle_message(
+        group_message(text="/start", sender_id=7001, chat_title="گروه تلگرام")
+    )
+
+    call = senders[Platform.TELEGRAM].sent[-1]
+    assert "سینک گروه" in call.text
+    assert any(
+        button.callback_data == "groupsync:pick"
+        for row in call.buttons
+        for button in row
+    )
+
+
+async def test_plain_member_start_gets_no_group_menu(
+    group_bridge: Bridge, repos: Repositories, senders
+) -> None:
+    await group_bridge.handle_message(
+        group_message(text="/start", sender_id=7001, chat_title="گروه تلگرام")
+    )
+
+    assert senders[Platform.TELEGRAM].sent == []

@@ -247,7 +247,21 @@ class Bridge:
             and leader.text.lstrip().startswith("/")
         ):
             command = parse_command(leader.text)
-            if command is not None and command.name == "groupsync":
+            if command is not None and command.name in {"start", "menu"}:
+                try:
+                    if await self._is_group_authorized(leader):
+                        await self._show_group_menu(leader)
+                except DomainError as exc:
+                    await self._send_group_notice(leader, exc.message)
+                except Exception as exc:  # noqa: BLE001 - never poison polling
+                    self._log.error(
+                        "group menu failed platform=%s chat_id=%s (%s)",
+                        leader.source.value,
+                        leader.chat_id,
+                        type(exc).__name__,
+                    )
+            elif command is not None and command.name == "groupsync":
+                # Kept as a hidden compatibility path; the visible entry is /start.
                 try:
                     await self._handle_groupsync_command(leader, command)
                 except DomainError as exc:
@@ -357,8 +371,8 @@ class Bridge:
     def _groupsync_help_text() -> str:
         return (
             "🔗 مدیریت سینک گروه‌ها (مالک ربات یا ادمین گروه)\n\n"
-            "/groupsync\n"
-            "باز کردن منوی دکمه‌ای سینک گروه.\n\n"
+            "برای باز کردن منو، در همین گروه /start را بفرستید.\n"
+            "بقیهٔ کارها کاملاً با دکمه‌های شیشه‌ای انجام می‌شود.\n\n"
             "با دکمهٔ «اتصال به گروه»، گروه مقصد را از فهرست گروه‌های "
             "شناخته‌شدهٔ پلتفرم مقابل انتخاب کنید.\n\n"
             "اگر شما ادمین گروه باشید، درخواست اتصال برای گروه مقصد ارسال "
