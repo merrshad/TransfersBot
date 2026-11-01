@@ -710,7 +710,7 @@ bale-to-telegram-bot/
 │   └── users.py
 ├── adapters/             # Telegram (PTB) و Bale (httpx) + poller
 ├── storage/db.py         # SQLite، migrationها و repositoryها
-├── tests/                # 732 تست آفلاین
+├── tests/                # 735 تست آفلاین
 ├── data/                 # دیتابیس و فایل‌های موقت (در runtime)
 └── MANUAL_TEST_CHECKLIST.md
 ```
