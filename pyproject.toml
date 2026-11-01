@@ -31,7 +31,7 @@ dev = [
 
 [tool.setuptools]
 packages = ["core", "storage", "adapters"]
-py-modules = ["config", "healthcheck", "logging_setup", "main"]
+py-modules = ["backup_to_bale", "config", "healthcheck", "logging_setup", "main"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

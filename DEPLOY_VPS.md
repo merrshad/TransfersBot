@@ -364,6 +364,41 @@ crontab -e
 find ~/backups -name 'bridge-*.db' -mtime +7 -delete
 ```
 
+### ارسال روزانهٔ backup به گروه بله
+
+اسکریپت `backup_to_bale.py` از دیتابیس نسخهٔ سازگار می‌سازد و آن را
+همراه تاریخ و ساعت به گروه بله می‌فرستد.
+
+در `.env` سرور:
+
+```dotenv
+BACKUP_BALE_BOT_TOKEN=...
+BACKUP_BALE_CHAT_ID=5160108235
+BACKUP_TIMEZONE_OFFSET_MINUTES=210
+```
+
+> توکن backup را در گیت، چت یا لاگ قرار ندهید. بهتر است ربات backup
+> جداگانه باشد و فقط در همان گروه ادمین شود.
+
+اجرای دستی برای تست:
+
+```bash
+cd /opt/bale-bridge
+docker compose run --rm bridge python backup_to_bale.py
+```
+
+cron روزانه، ساعت **۰۳:۰۰ به وقت ایران** (سرور UTC است؛ ۲۳:۳۰ روز قبل):
+
+```cron
+30 23 * * * cd /opt/bale-bridge && /usr/bin/docker compose run --rm bridge python backup_to_bale.py >> /home/ubuntu/bale-backup.log 2>&1
+```
+
+بررسی لاگ:
+
+```bash
+tail -n 50 /home/ubuntu/bale-backup.log
+```
+
 ---
 
 ## ۹. به‌روزرسانی

@@ -24,7 +24,7 @@ COPY pyproject.toml README.md ./
 COPY core ./core
 COPY storage ./storage
 COPY adapters ./adapters
-COPY config.py logging_setup.py main.py healthcheck.py ./
+COPY config.py logging_setup.py main.py healthcheck.py backup_to_bale.py ./
 
 RUN pip install --upgrade pip \
     && pip install ".[media]"
@@ -49,7 +49,7 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --chown=app:app core ./core
 COPY --chown=app:app storage ./storage
 COPY --chown=app:app adapters ./adapters
-COPY --chown=app:app config.py logging_setup.py main.py healthcheck.py ./
+COPY --chown=app:app config.py logging_setup.py main.py healthcheck.py backup_to_bale.py ./
 
 # Both paths are Docker volume mount points. Keeping them owned by the runtime
 # user lets a fresh named volume inherit the right permissions.
