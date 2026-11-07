@@ -63,6 +63,7 @@ def inbound_msg(
     chat_id: int | None = None,
     entities: tuple[dict, ...] = (),
     reply_to: MessageRef | None = None,
+    forwarded_from: str | None = None,
 ) -> UnifiedMessage:
     """An inbound message (plain text plus optional entities/reply)."""
     return UnifiedMessage(
@@ -74,6 +75,7 @@ def inbound_msg(
         entities=entities,  # type: ignore[arg-type]
         reply_to=reply_to,
         timestamp=FIXED_NOW,
+        forwarded_from=forwarded_from,
     )
 
 
@@ -693,3 +695,24 @@ async def test_worker_logs_only_ids_and_statuses(
 
     assert "outbox delivered" in caplog.text
     assert "متن محرمانه برای لاگ" not in caplog.text
+
+async def test_private_relay_includes_forwarded_channel_name(
+    bridge: Bridge,
+    users: UserService,
+    pairing: PairingService,
+    repos: Repositories,
+) -> None:
+    _, _, pair = await make_pair(bridge, users, pairing, repos)
+
+    await bridge.handle_message(
+        inbound_msg(
+            Platform.TELEGRAM,
+            TELEGRAM_USER,
+            "خبر فورواردی",
+            message_id=11,
+            forwarded_from="کانال خبری",
+        )
+    )
+
+    payload = repos.outbox.list_for_pair(pair.id)[-1].payload
+    assert payload["text"] == "↪️ فوروارد از: کانال خبری\nخبر فورواردی"

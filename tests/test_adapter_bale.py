@@ -62,6 +62,7 @@ def bale_message(
     chat_id: int = 7001,
     message_id: int = 21,
     reply_to_message: dict[str, Any] | None = None,
+    forward_from_chat: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Raw Bale update payload as documented."""
     message: dict[str, Any] = {
@@ -75,6 +76,8 @@ def bale_message(
         message["from"] = {"id": chat_id, "is_bot": False, "first_name": "Ali"}
     if reply_to_message is not None:
         message["reply_to_message"] = reply_to_message
+    if forward_from_chat is not None:
+        message["forward_from_chat"] = forward_from_chat
     return {"update_id": update_id, "message": message}
 
 
@@ -128,6 +131,23 @@ def test_parse_update_converts_group_message_with_sender_label() -> None:
     assert message.is_group is True
     assert message.chat_id == 4497595490
     assert message.sender_name == "مهدی"
+
+
+def test_parse_update_captures_forwarded_channel_title() -> None:
+    message = parse_update(
+        bale_message(
+            chat_type="group",
+            chat_id=4497595490,
+            forward_from_chat={
+                "id": 123456,
+                "type": "channel",
+                "title": "News Channel",
+            },
+        )
+    )
+
+    assert message is not None
+    assert message.forwarded_from == "News Channel"
 
 
 def test_parse_update_converts_callback_query() -> None:

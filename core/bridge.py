@@ -1242,14 +1242,42 @@ class Bridge:
         )
         return (cleaned[:64] or "کاربر").strip()
 
-    @classmethod
-    def _group_text(cls, sender: str, body: str) -> str:
-        """Prefix a text relay with its group sender."""
-        return f"👤 {sender}:\n{body}" if body else f"👤 {sender}"
+    @staticmethod
+    def _forwarded_label(message: UnifiedMessage) -> str | None:
+        """Safe one-line label for a forwarded channel/chat, if any."""
+        raw = " ".join((message.forwarded_from or "").split())
+        cleaned = "".join(
+            char for char in raw if char not in {"*", "_", "`", "[", "]"}
+        )
+        return cleaned[:64].strip() or None
 
     @classmethod
-    def _group_caption(cls, sender: str, caption: str) -> str:
-        """Prefix a media caption with its group sender."""
+    def _with_forward(cls, message: UnifiedMessage, body: str) -> str:
+        """Prefix a private relay with its forward source."""
+        label = cls._forwarded_label(message)
+        if label is None:
+            return body
+        line = f"↪️ فوروارد از: {label}"
+        return f"{line}\n{body}" if body else line
+
+    @classmethod
+    def _group_text(
+        cls, sender: str, body: str, forwarded_from: str | None = None
+    ) -> str:
+        """Prefix a text relay with its group sender and forward source."""
+        header = f"👤 {sender}:"
+        if forwarded_from is not None:
+            header += f"\n↪️ فوروارد از: {forwarded_from}"
+        return f"{header}\n{body}" if body else header
+
+    @classmethod
+    def _group_caption(
+        cls, sender: str, caption: str, forwarded_from: str | None = None
+    ) -> str:
+        """Prefix a media caption with its group sender and forward source."""
+        if forwarded_from is not None:
+            header = f"👤 {sender}:\n↪️ فوروارد از: {forwarded_from}"
+            return f"{header}\n{caption}" if caption else header
         return f"👤 {sender}: {caption}" if caption else f"👤 {sender}"
 
     def _group_payload(
@@ -1266,6 +1294,7 @@ class Bridge:
     ) -> dict[str, object]:
         """Payload for one queued group message (ids + rendered content)."""
         sender = self._group_sender_label(message.sender_name)
+        forwarded_from = self._forwarded_label(message)
         rendered = render_relay_text(
             message.text or "", message.entities, target_platform
         )
@@ -1284,20 +1313,22 @@ class Bridge:
         if message.media:
             payload.update(
                 kind=GROUP_MEDIA_PAYLOAD_KIND,
-                text=self._group_caption(sender, rendered),
+                text=self._group_caption(sender, rendered, forwarded_from),
                 items=[media_item_payload(item) for item in message.media],
             )
         elif message.unsupported is not None:
             payload.update(
                 kind=GROUP_TEXT_PAYLOAD_KIND,
                 text=self._group_text(
-                    sender, unsupported_placeholder(message.unsupported)
+                    sender,
+                    unsupported_placeholder(message.unsupported),
+                    forwarded_from,
                 ),
             )
         else:
             payload.update(
                 kind=GROUP_TEXT_PAYLOAD_KIND,
-                text=self._group_text(sender, rendered),
+                text=self._group_text(sender, rendered, forwarded_from),
             )
         if album_id is not None:
             payload["album_id"] = album_id
@@ -1729,9 +1760,10 @@ class Bridge:
             "source_message_id": message.message_id,
         }
         if message.media:
+            caption = render(message.text or "", message.entities)
             payload.update(
                 kind=RELAY_MEDIA_KIND,
-                text=render(message.text or "", message.entities) or None,
+                text=self._with_forward(message, caption) or None,
                 items=[media_item_payload(item) for item in message.media],
             )
         elif message.unsupported is not None:
@@ -1743,12 +1775,16 @@ class Bridge:
             )
             payload.update(
                 kind=RELAY_PAYLOAD_KIND,
-                text=unsupported_placeholder(message.unsupported),
+                text=self._with_forward(
+                    message, unsupported_placeholder(message.unsupported)
+                ),
             )
         else:
             payload.update(
                 kind=RELAY_PAYLOAD_KIND,
-                text=render(message.text or "", message.entities),
+                text=self._with_forward(
+                    message, render(message.text or "", message.entities)
+                ),
             )
         if album_id is not None:
             payload["album_id"] = album_id

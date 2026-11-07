@@ -104,6 +104,7 @@ def group_message(
     callback_data: str | None = None,
     callback_id: str | None = None,
     chat_title: str | None = None,
+    forwarded_from: str | None = None,
 ) -> UnifiedMessage:
     """A group UnifiedMessage helper."""
     if sender_id is None:
@@ -121,6 +122,7 @@ def group_message(
         chat_title=chat_title,
         sender_name=sender_name,
         is_bot_sender=is_bot,
+        forwarded_from=forwarded_from,
         callback_data=callback_data,
         callback_id=callback_id,
     )
@@ -893,3 +895,21 @@ async def test_plain_member_start_gets_no_group_menu(
     )
 
     assert senders[Platform.TELEGRAM].sent == []
+
+async def test_group_forwarded_channel_name_is_in_relay(
+    group_bridge: Bridge, repos: Repositories, link
+) -> None:
+    await group_bridge.handle_message(
+        group_message(
+            message_id=13,
+            text="خبر فورواردی",
+            sender_name="Ali",
+            forwarded_from="کانال خبری",
+        )
+    )
+
+    (entry,) = repos.group_outbox.list_for_link(link.id)
+    text = entry.payload["text"]
+    assert "👤 Ali:" in text
+    assert "↪️ فوروارد از: کانال خبری" in text
+    assert "خبر فورواردی" in text

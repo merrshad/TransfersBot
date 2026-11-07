@@ -219,6 +219,37 @@ def _sender_name(sender: Mapping[str, Any]) -> str:
     return name or _as_str(sender.get("username")) or "کاربر"
 
 
+def _forwarded_from(message: Mapping[str, Any]) -> str | None:
+    """Name of the channel/chat/user a Bale message was forwarded from."""
+    origin = _mapping(message.get("forward_origin"))
+    if origin is not None:
+        for key in ("chat", "sender_chat", "sender_user"):
+            source = _mapping(origin.get(key))
+            if source is not None:
+                label: str | None = _as_str(source.get("title")) or _sender_name(
+                    source
+                )
+                if label and label != "کاربر":
+                    return label
+        hidden = _as_str(origin.get("sender_user_name"))
+        if hidden:
+            return hidden
+
+    source = _mapping(message.get("forward_from_chat"))
+    if source is not None:
+        label = _as_str(source.get("title")) or _as_str(source.get("username"))
+        if label is None:
+            label = _sender_name(source)
+        if label and label != "کاربر":
+            return label
+    source = _mapping(message.get("forward_from"))
+    if source is not None:
+        label = _sender_name(source)
+        if label and label != "کاربر":
+            return label
+    return _as_str(message.get("forward_sender_name"))
+
+
 def _media_from_object(
     raw: Mapping[str, Any], kind: MediaKind, *, mime_default: str | None = None
 ) -> MediaItem | None:
@@ -432,6 +463,7 @@ def parse_update(raw: Mapping[str, Any]) -> UnifiedMessage | None:
         chat_title=_as_str(chat.get("title")),
         sender_name=_sender_name(sender),
         is_bot_sender=bool(sender.get("is_bot", False)),
+        forwarded_from=_forwarded_from(message),
     )
 
 

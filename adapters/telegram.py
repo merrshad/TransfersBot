@@ -22,7 +22,7 @@ items.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol, runtime_checkable
@@ -359,6 +359,71 @@ def _sender_name(sender: object) -> str:
     return "کاربر"
 
 
+def _chat_label(chat: object) -> str | None:
+    """Title or username of a forwarded chat, if it has one."""
+    for attribute in ("title", "username", "full_name"):
+        value = getattr(chat, attribute, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _mapping_label(value: object) -> str | None:
+    """Label for a raw forwarded chat/user payload kept in ``api_kwargs``."""
+    if not isinstance(value, Mapping):
+        return None
+    for key in ("title", "username"):
+        label = value.get(key)
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    name = " ".join(
+        str(value.get(key)).strip()
+        for key in ("first_name", "last_name")
+        if isinstance(value.get(key), str) and str(value.get(key)).strip()
+    ).strip()
+    return name or None
+
+
+def _forwarded_from(message: Message) -> str | None:
+    """Name of the channel/chat/user a Telegram message was forwarded from."""
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        for attribute in ("chat", "sender_chat"):
+            label = _chat_label(getattr(origin, attribute, None))
+            if label:
+                return label
+        label = _chat_label(getattr(origin, "sender_user", None))
+        if label:
+            return label
+        hidden = getattr(origin, "sender_user_name", None)
+        if isinstance(hidden, str) and hidden.strip():
+            return hidden.strip()
+
+    # Older Bot API shapes still appear in some clients/updates.
+    label = _chat_label(getattr(message, "forward_from_chat", None))
+    if label:
+        return label
+    label = _chat_label(getattr(message, "forward_from", None))
+    if label:
+        return label
+    hidden = getattr(message, "forward_sender_name", None)
+    if isinstance(hidden, str) and hidden.strip():
+        return hidden.strip()
+
+    # PTB 22 keeps legacy Bot API forward fields in api_kwargs instead of
+    # exposing them as attributes.
+    api_kwargs = getattr(message, "api_kwargs", None)
+    if isinstance(api_kwargs, Mapping):
+        for key in ("forward_from_chat", "forward_from"):
+            label = _mapping_label(api_kwargs.get(key))
+            if label:
+                return label
+        hidden = api_kwargs.get("forward_sender_name")
+        if isinstance(hidden, str) and hidden.strip():
+            return hidden.strip()
+    return None
+
+
 def to_unified_message(update: Update) -> UnifiedMessage | None:
     """Convert one Telegram update into a :class:`UnifiedMessage`.
 
@@ -445,6 +510,7 @@ def to_unified_message(update: Update) -> UnifiedMessage | None:
         chat_title=chat.title if isinstance(chat.title, str) else None,
         sender_name=_sender_name(sender),
         is_bot_sender=bool(getattr(sender, "is_bot", False)),
+        forwarded_from=_forwarded_from(message),
     )
 
 

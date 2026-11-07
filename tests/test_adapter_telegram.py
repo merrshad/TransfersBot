@@ -42,6 +42,7 @@ def message_update(
     message_id: int = 11,
     reply: dict[str, Any] | None = None,
     entities: list[dict[str, Any]] | None = None,
+    forward_from_chat: dict[str, Any] | None = None,
 ) -> Update:
     """Build a real ``telegram.Update`` from a raw payload."""
     message: dict[str, Any] = {
@@ -57,6 +58,8 @@ def message_update(
         message["reply_to_message"] = reply
     if entities is not None:
         message["entities"] = entities
+    if forward_from_chat is not None:
+        message["forward_from_chat"] = forward_from_chat
     return Update.de_json({"update_id": update_id, "message": message}, BOT)
 
 
@@ -249,6 +252,26 @@ def test_group_message_is_converted_with_sender_label() -> None:
     assert message.chat_id == -100123
     assert message.sender_name == "Ali"
     assert message.is_bot_sender is False
+
+
+def test_forwarded_channel_title_is_captured() -> None:
+    message = to_unified_message(
+        message_update(
+            update_id=5,
+            text="خبر فورواردی",
+            chat_type="supergroup",
+            chat_id=-100123,
+            message_id=78,
+            forward_from_chat={
+                "id": -100987654321,
+                "type": "channel",
+                "title": "کانال خبری",
+            },
+        )
+    )
+
+    assert message is not None
+    assert message.forwarded_from == "کانال خبری"
 
 
 def test_callback_without_data_is_skipped() -> None:

@@ -164,6 +164,8 @@ class UnifiedMessage:
     chat_title: str | None = None
     sender_name: str | None = None
     is_bot_sender: bool = False
+    # Name of the channel/chat/user this message was forwarded from.
+    forwarded_from: str | None = None
 
     def __post_init__(self) -> None:
         if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
